@@ -87,7 +87,7 @@ pipeline {
                                 --request POST \
                                 --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                                 --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Checkout — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Checkout\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Checkout - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Checkout\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
                         '''
                     }
@@ -123,7 +123,7 @@ pipeline {
                                 --request POST \
                                 --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                                 --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Build and Unit Tests — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Build and Unit Tests\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Build and Unit Tests - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Build and Unit Tests\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
                         '''
                     }
@@ -133,45 +133,39 @@ pipeline {
 
         stage('SonarQube SAST') {
             steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'sonarqube-token',
-                        variable: 'SONAR_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(
+                            credentialsId: 'sonarqube-token',
+                            variable: 'SONAR_TOKEN'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
 
-                        sonar-scanner \
-                          -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
-                          -Dsonar.projectName="$SONAR_PROJECT_KEY" \
-                          -Dsonar.sources=. \
-                          -Dsonar.host.url="$SONAR_HOST_URL" \
-                          -Dsonar.token="$SONAR_TOKEN" \
-                          -Dsonar.qualitygate.wait=true
-                    '''
+                            sonar-scanner \
+                              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                              -Dsonar.projectName="$SONAR_PROJECT_KEY" \
+                              -Dsonar.sources=. \
+                              -Dsonar.host.url="$SONAR_HOST_URL" \
+                              -Dsonar.token="$SONAR_TOKEN" \
+                              -Dsonar.qualitygate.wait=true
+                        '''
+                    }
                 }
             }
             post {
                 failure {
                     withCredentials([
-                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY'),
-                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
                     ]) {
                         sh '''
                             curl --silent --output /dev/null --max-time 5 \
                                 --request POST \
                                 --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                                 --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] SonarQube SAST — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: SonarQube SAST\\nQuality gate failed or scanner error.\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] SonarQube SAST - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: SonarQube SAST\\nQuality gate failed or scanner error.\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
-
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"engagement\":${DEFECTDOJO_ENGAGEMENT_ID:-1},\"notes\":\"SonarQube SAST stage failed — ${JOB_NAME} #${BUILD_NUMBER} — ${BUILD_URL}\"}" \
-                                "${DEFECTDOJO_URL}/api/v2/notes/" || true
                         '''
                     }
                 }
@@ -179,78 +173,125 @@ pipeline {
         }
 
 
+        stage('Trivy SCA') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                ]) {
+                    sh '''
+                        set -eu
+                        mkdir -p artifacts/trivy
+                        trivy fs \
+                            --exit-code 0 \
+                            --format json \
+                            --output artifacts/trivy/trivy-report.json \
+                            --scanners vuln,secret \
+                            --skip-dirs .git,node_modules,artifacts \
+                            .
+                        export DEFECTDOJO_SCAN_FILE="artifacts/trivy/trivy-report.json"
+                        export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
+                        export DEFECTDOJO_TEST_TITLE="Trivy SCA"
+                        /opt/devsecops/scripts/defectdojo_import.sh
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/trivy/**',
+                        allowEmptyArchive: true
+                    )
+                }
+                failure {
+                    withCredentials([string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')]) {
+                        sh '''
+                            curl --silent --output /dev/null --max-time 5 \
+                                --request POST \
+                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                                --header "Content-Type: application/json" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Trivy SCA - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Trivy SCA\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                "${REDMINE_URL}/issues.json" || true
+                        '''
+                    }
+                }
+            }
+        }
+
         stage('Joern CPG Analysis') {
             steps {
-                sh '''
-                    set -eu
+                withCredentials([
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                ]) {
+                    sh '''
+                        set -eu
 
-                    mkdir -p artifacts/joern
-                    command -v joern-parse
+                        mkdir -p artifacts/joern
+                        command -v joern-parse
 
-                    # Avoid scanning dependencies and generated files.
-                    find . -type d \\( \
-                        -name node_modules -o \
-                        -name .git -o \
-                        -name target -o \
-                        -name build -o \
-                        -name dist -o \
-                        -name artifacts \
-                    \\) -prune -o -type f -print \
-                        > artifacts/joern/source-files.txt
+                        # Avoid scanning dependencies and generated files.
+                        find . -type d \\( \
+                            -name node_modules -o \
+                            -name .git -o \
+                            -name target -o \
+                            -name build -o \
+                            -name dist -o \
+                            -name artifacts \
+                        \\) -prune -o -type f -print \
+                            > artifacts/joern/source-files.txt
 
-                    run_parser() {
-                        language="$1"
-                        pattern="$2"
-                        output="artifacts/joern/${language}-cpg.bin"
-                        filelist="artifacts/joern/${language}-files.txt"
+                        run_parser() {
+                            language="$1"
+                            pattern="$2"
+                            output="artifacts/joern/${language}-cpg.bin"
+                            filelist="artifacts/joern/${language}-files.txt"
 
-                        grep -Ei "$pattern" artifacts/joern/source-files.txt \
-                            > "$filelist" || true
+                            grep -Ei "$pattern" artifacts/joern/source-files.txt \
+                                > "$filelist" || true
 
-                        if [ ! -s "$filelist" ]; then
-                            echo "Skipping $language: no matching files."
-                            return 0
-                        fi
+                            if [ ! -s "$filelist" ]; then
+                                echo "Skipping $language: no matching files."
+                                return 0
+                            fi
 
-                        echo "Parsing language: $language"
+                            echo "Parsing language: $language"
 
-                        # Build a clean input directory containing only
-                        # files matched for this language.
-                        input_dir="artifacts/joern/input-${language}"
-                        mkdir -p "$input_dir"
+                            input_dir="artifacts/joern/input-${language}"
+                            mkdir -p "$input_dir"
 
-                        while IFS= read -r file; do
-                            [ -f "$file" ] || continue
-                            relative="${file#./}"
-                            mkdir -p "$input_dir/$(dirname "$relative")"
-                            cp "$file" "$input_dir/$relative"
-                        done < "$filelist"
+                            while IFS= read -r file; do
+                                [ -f "$file" ] || continue
+                                relative="${file#./}"
+                                mkdir -p "$input_dir/$(dirname "$relative")"
+                                cp "$file" "$input_dir/$relative"
+                            done < "$filelist"
 
-                        if find "$input_dir" -type f -print -quit | grep -q .; then
-                            joern-parse \
-                                --language "$language" \
-                                --output "$output" \
-                                "$input_dir"
-                            test -s "$output"
-                        fi
-                    }
+                            if find "$input_dir" -type f -print -quit | grep -q .; then
+                                joern-parse \
+                                    --language "$language" \
+                                    --output "$output" \
+                                    "$input_dir"
+                                test -s "$output"
+                            fi
+                        }
 
-                    run_parser javascript '\\.(js|jsx|mjs|cjs)$'
-                    run_parser python '\\.py$'
-                    run_parser java '\\.java$'
-                    run_parser kotlin '\\.kt$'
-                    run_parser golang '\\.go$'
-                    run_parser csharp '\\.cs$'
-                    run_parser php '\\.php$'
-                    run_parser rubysrc '\\.rb$'
-                    run_parser c '\\.c$'
-                    run_parser newc '\\.(cc|cpp|cxx|h|hpp|hh|hxx)$'
-                    run_parser rust '\\.rs$'
-                    run_parser swift '\\.swift$'
-                    run_parser abap '\\.abap$'
+                        run_parser javascript '\\.(js|jsx|mjs|cjs)$'
+                        run_parser python '\\.py$'
+                        run_parser java '\\.java$'
+                        run_parser kotlin '\\.kt$'
+                        run_parser golang '\\.go$'
+                        run_parser csharp '\\.cs$'
+                        run_parser php '\\.php$'
+                        run_parser rubysrc '\\.rb$'
+                        run_parser c '\\.c$'
+                        run_parser newc '\\.(cc|cpp|cxx|h|hpp|hh|hxx)$'
+                        run_parser rust '\\.rs$'
+                        run_parser swift '\\.swift$'
+                        run_parser abap '\\.abap$'
 
-                    echo "Joern parsing completed."
-                '''
+                        echo "Joern parsing completed."
+                        /opt/devsecops/scripts/joern_import.sh
+                    '''
+                }
             }
             post {
                 always {
@@ -293,7 +334,7 @@ pipeline {
                                 --request POST \
                                 --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                                 --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Qualys Export — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Qualys Export\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Qualys Export - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Qualys Export\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
                         '''
                     }
@@ -310,10 +351,27 @@ pipeline {
                     sh '''
                         set -eu
                         mkdir -p artifacts/sonar
-                        curl --silent --show-error --max-time 30 \
-                            --header "Authorization: Bearer ${SONAR_TOKEN}" \
-                            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500&additionalFields=_all" \
-                            -o artifacts/sonar/sonar-report.json
+
+                        # Paginate through all SonarQube issues
+                        page=1
+                        total_pages=1
+                        all_issues="[]"
+                        while [ "$page" -le "$total_pages" ]; do
+                            response="$(curl --silent --show-error --max-time 30 \
+                                --header "Authorization: Bearer ${SONAR_TOKEN}" \
+                                "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500&p=${page}&additionalFields=_all")"
+                            total="$(echo "$response" | jq -r '.total // 0')"
+                            total_pages=$(( (total + 499) / 500 ))
+                            issues="$(echo "$response" | jq '.issues')"
+                            all_issues="$(jq -n --argjson a "$all_issues" --argjson b "$issues" '$a + $b')"
+                            page=$(( page + 1 ))
+                        done
+
+                        jq -n \
+                            --argjson issues "$all_issues" \
+                            '{"issues": $issues, "total": ($issues | length), "p": 1, "ps": ($issues | length)}' \
+                            > artifacts/sonar/sonar-report.json
+
                         export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
                         export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
                         /opt/devsecops/scripts/defectdojo_import.sh
@@ -330,7 +388,7 @@ pipeline {
                                 --request POST \
                                 --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                                 --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] DefectDojo Import — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: DefectDojo Import\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] DefectDojo Import - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: DefectDojo Import\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
                         '''
                     }
@@ -364,7 +422,7 @@ pipeline {
                                 --request POST \
                                 --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                                 --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Redmine Sync — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Redmine Sync\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
+                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Redmine Sync - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Redmine Sync\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
                         '''
                     }

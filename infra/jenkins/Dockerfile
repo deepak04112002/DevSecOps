@@ -7,12 +7,22 @@ RUN apt-get update \
        ca-certificates \
        curl \
        git \
+       gnupg \
        jq \
        python3 \
        python3-requests \
        unzip \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Trivy — SCA and filesystem vulnerability scanning
+RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
+    | gpg --dearmor -o /usr/share/keyrings/trivy.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+    > /etc/apt/sources.list.d/trivy.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends trivy \
     && rm -rf /var/lib/apt/lists/*
 
 ARG SONAR_SCANNER_VERSION=6.2.0.4584
