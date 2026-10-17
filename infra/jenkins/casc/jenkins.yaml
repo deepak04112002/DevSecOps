@@ -1,0 +1,24 @@
+jenkins:
+  systemMessage: "Local DevSecOps lab. Do not expose publicly."
+  numExecutors: 0
+  mode: EXCLUSIVE
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users: []
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+  remotingSecurity:
+    enabled: true
+
+unclassified:
+  gitHubPluginConfig:
+    configs:
+      - name: "GitHub"
+        apiUrl: "https://api.github.com"
+        credentialsId: "github-token"
+        manageHooks: true

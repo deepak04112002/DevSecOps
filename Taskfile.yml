@@ -1,0 +1,56 @@
+version: "3"
+
+tasks:
+  init:
+    desc: Create directories and initial environment file
+    cmds:
+      - mkdir -p workspace artifacts secrets
+      - test -f .env || cp .env.example .env
+      - chmod 600 .env
+      - echo "Edit .env before starting services."
+
+  validate:
+    desc: Validate Docker Compose configuration
+    cmds:
+      - docker compose config --quiet
+
+  build:
+    desc: Build local images
+    cmds:
+      - docker compose build
+
+  up:
+    desc: Start the local stack
+    cmds:
+      - docker compose up -d --build
+
+  down:
+    desc: Stop services but preserve persistent volumes
+    cmds:
+      - docker compose down
+
+  down-wipe:
+    desc: Stop services and delete all named volumes
+    prompt: This permanently deletes database data. Continue?
+    cmds:
+      - docker compose down -v
+
+  ps:
+    desc: Show service status
+    cmds:
+      - docker compose ps
+
+  logs:
+    desc: Follow service logs
+    cmds:
+      - docker compose logs -f --tail=200
+
+  joern:
+    desc: Run Joern analysis on the mounted source
+    cmds:
+      - docker compose --profile analysis run --rm joern
+
+  smoke:
+    desc: Run staging smoke test
+    cmds:
+      - docker compose --profile tools run --rm smoke

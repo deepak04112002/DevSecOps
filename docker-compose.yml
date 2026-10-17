@@ -1,0 +1,371 @@
+
+name: ${COMPOSE_PROJECT_NAME:-devsecops}
+
+services:
+  jenkins:
+    build:
+      context: ./infra/jenkins
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${JENKINS_HTTP_PORT:-8080}:8080"
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=true"
+      CASC_JENKINS_CONFIG: /usr/share/jenkins/ref/casc/jenkins.yaml
+      SONAR_HOST_URL: http://sonarqube:9000
+      DEFECTDOJO_URL: http://defectdojo-nginx:8080
+      REDMINE_URL: http://redmine:3000
+      QUALYS_BASE_URL: ${QUALYS_BASE_URL:-https://qualysapi.qualys.com}
+      DEFECTDOJO_SCAN_TYPE: ${DEFECTDOJO_SCAN_TYPE:-Qualys Scan}
+      REDMINE_PROJECT_ID: ${REDMINE_PROJECT_ID:-1}
+      REDMINE_TRACKER_ID: ${REDMINE_TRACKER_ID:-1}
+      REDMINE_STATUS_ID: ${REDMINE_STATUS_ID:-1}
+      REDMINE_PRIORITY_ID: ${REDMINE_PRIORITY_ID:-2}
+      STAGING_BASE_URL: ${STAGING_BASE_URL:-}
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - ${APP_SOURCE_HOST_PATH:-./workspace}:/workspace/external-app:ro
+      - ./artifacts:/workspace/artifacts
+      - ./scripts:/opt/devsecops/scripts:ro
+    networks:
+      - ci
+      - security
+    depends_on:
+      sonarqube:
+        condition: service_started
+    security_opt:
+      - no-new-privileges:true
+
+  sonarqube:
+    image: sonarqube:26.10.0.133078-community
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SONARQUBE_PORT:-9000}:9000"
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD:?Set SONAR_DB_PASSWORD in .env}
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_extensions:/opt/sonarqube/extensions
+      - sonar_logs:/opt/sonarqube/logs
+    networks:
+      - security
+      - sonar_db_net
+    depends_on:
+      sonar-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://localhost:9000/api/system/status | grep -q '\"status\":\"UP\"' || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+
+  sonar-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sonar
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD:?Set SONAR_DB_PASSWORD in .env}
+    volumes:
+      - sonar_db_data:/var/lib/postgresql/data
+    networks:
+      - sonar_db_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar -d sonar"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  # DefectDojo reverse proxy: serves static assets and forwards
+  # application requests to the Django/uWSGI service.
+  defectdojo-nginx:
+    image: defectdojo/defectdojo-nginx:${DEFECTDOJO_VERSION:-latest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DEFECTDOJO_PORT:-8081}:8080"
+    environment:
+      DD_UWSGI_HOST: defectdojo
+      DD_UWSGI_PORT: "3031"
+      NGINX_METRICS_ENABLED: "false"
+    volumes:
+      - dojo_media:/usr/share/nginx/html/media
+    depends_on:
+      defectdojo:
+        condition: service_started
+    networks:
+      - security
+    security_opt:
+      - no-new-privileges:true
+
+  # DefectDojo initialization runs separately from the web server.
+  defectdojo-init:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-latest}
+    restart: "no"
+    entrypoint:
+      - /wait-for-it.sh
+      - dojo-db:5432
+      - --
+      - /entrypoint-initializer.sh
+    environment:
+      DD_DATABASE_URL: >-
+        postgresql://dojo:${DD_DB_PASSWORD:?Set DD_DB_PASSWORD in .env}@dojo-db:5432/dojo
+      DD_SECRET_KEY: ${DD_SECRET_KEY:?Set DD_SECRET_KEY in .env}
+      DD_CREDENTIAL_AES_256_KEY: ${DD_CREDENTIAL_AES_256_KEY:?Set DD_CREDENTIAL_AES_256_KEY in .env}
+      DD_CELERY_BROKER_URL: redis://dojo-redis:6379/0
+      DD_CACHE_URL: redis://dojo-redis:6379/1
+      DD_ALLOWED_HOSTS: "localhost,127.0.0.1,defectdojo"
+      DD_DEBUG: "False"
+      DD_INITIALIZE: "true"
+      DD_ADMIN_USER: ${DD_ADMIN_USER:-admin}
+      DD_ADMIN_MAIL: ${DD_ADMIN_MAIL:-admin@example.com}
+      DD_ADMIN_FIRST_NAME: ${DD_ADMIN_FIRST_NAME:-Admin}
+      DD_ADMIN_LAST_NAME: ${DD_ADMIN_LAST_NAME:-User}
+    depends_on:
+      dojo-db:
+        condition: service_healthy
+    networks:
+      - dojo_db_net
+    security_opt:
+      - no-new-privileges:true
+
+  # DefectDojo Django application / uWSGI.
+  defectdojo:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-latest}
+    restart: unless-stopped
+    entrypoint:
+      - /wait-for-it.sh
+      - dojo-db:5432
+      - -t
+      - "60"
+      - --
+      - /entrypoint-uwsgi.sh
+    expose:
+      - "3031"
+    environment:
+      DD_DATABASE_URL: >-
+        postgresql://dojo:${DD_DB_PASSWORD:?Set DD_DB_PASSWORD in .env}@dojo-db:5432/dojo
+      DD_SECRET_KEY: ${DD_SECRET_KEY:?Set DD_SECRET_KEY in .env}
+      DD_CREDENTIAL_AES_256_KEY: ${DD_CREDENTIAL_AES_256_KEY:?Set DD_CREDENTIAL_AES_256_KEY in .env}
+      DD_CELERY_BROKER_URL: redis://dojo-redis:6379/0
+      DD_CACHE_URL: redis://dojo-redis:6379/1
+      DD_ALLOWED_HOSTS: "localhost,127.0.0.1,defectdojo"
+      DD_DEBUG: "False"
+      DD_DATABASE_READINESS_TIMEOUT: "60"
+    volumes:
+      - dojo_media:/app/media
+      - ./infra/defectdojo/extra_settings:/app/docker/extra_settings:ro
+    depends_on:
+      defectdojo-init:
+        condition: service_completed_successfully
+      dojo-db:
+        condition: service_healthy
+      dojo-redis:
+        condition: service_healthy
+    networks:
+      - security
+      - dojo_db_net
+    security_opt:
+      - no-new-privileges:true
+
+  dojo-worker:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-latest}
+    restart: unless-stopped
+    entrypoint:
+      - /wait-for-it.sh
+      - dojo-db:5432
+      - -t
+      - "60"
+      - --
+      - /entrypoint-celery-worker.sh
+    environment:
+      DD_DATABASE_URL: >-
+        postgresql://dojo:${DD_DB_PASSWORD:?Set DD_DB_PASSWORD in .env}@dojo-db:5432/dojo
+      DD_SECRET_KEY: ${DD_SECRET_KEY:?Set DD_SECRET_KEY in .env}
+      DD_CREDENTIAL_AES_256_KEY: ${DD_CREDENTIAL_AES_256_KEY:?Set DD_CREDENTIAL_AES_256_KEY in .env}
+      DD_CELERY_BROKER_URL: redis://dojo-redis:6379/0
+      DD_CACHE_URL: redis://dojo-redis:6379/1
+      DD_DATABASE_READINESS_TIMEOUT: "60"
+    volumes:
+      - dojo_media:/app/media
+      - ./infra/defectdojo/extra_settings:/app/docker/extra_settings:ro
+    depends_on:
+      defectdojo-init:
+        condition: service_completed_successfully
+      dojo-db:
+        condition: service_healthy
+      dojo-redis:
+        condition: service_healthy
+    networks:
+      - dojo_db_net
+    security_opt:
+      - no-new-privileges:true
+
+  dojo-beat:
+    image: defectdojo/defectdojo-django:${DEFECTDOJO_VERSION:-latest}
+    restart: unless-stopped
+    entrypoint:
+      - /wait-for-it.sh
+      - dojo-db:5432
+      - -t
+      - "60"
+      - --
+      - /entrypoint-celery-beat.sh
+    environment:
+      DD_DATABASE_URL: >-
+        postgresql://dojo:${DD_DB_PASSWORD:?Set DD_DB_PASSWORD in .env}@dojo-db:5432/dojo
+      DD_SECRET_KEY: ${DD_SECRET_KEY:?Set DD_SECRET_KEY in .env}
+      DD_CREDENTIAL_AES_256_KEY: ${DD_CREDENTIAL_AES_256_KEY:?Set DD_CREDENTIAL_AES_256_KEY in .env}
+      DD_CELERY_BROKER_URL: redis://dojo-redis:6379/0
+      DD_CACHE_URL: redis://dojo-redis:6379/1
+      DD_DATABASE_READINESS_TIMEOUT: "60"
+    volumes:
+      - dojo_media:/app/media
+      - ./infra/defectdojo/extra_settings:/app/docker/extra_settings:ro
+    depends_on:
+      defectdojo-init:
+        condition: service_completed_successfully
+      dojo-db:
+        condition: service_healthy
+      dojo-redis:
+        condition: service_healthy
+    networks:
+      - dojo_db_net
+    security_opt:
+      - no-new-privileges:true
+
+  dojo-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dojo
+      POSTGRES_USER: dojo
+      POSTGRES_PASSWORD: ${DD_DB_PASSWORD:?Set DD_DB_PASSWORD in .env}
+    volumes:
+      - dojo_db_data:/var/lib/postgresql/data
+    networks:
+      - dojo_db_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dojo -d dojo"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  dojo-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - dojo_redis_data:/data
+    networks:
+      - dojo_db_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  redmine:
+    image: redmine:6
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${REDMINE_PORT:-3000}:3000"
+    environment:
+      REDMINE_DB_POSTGRES: redmine-db
+      REDMINE_DB_DATABASE: redmine
+      REDMINE_DB_USERNAME: redmine
+      REDMINE_DB_PASSWORD: ${REDMINE_DB_PASSWORD:?Set REDMINE_DB_PASSWORD in .env}
+    depends_on:
+      redmine-db:
+        condition: service_healthy
+    volumes:
+      - redmine_files:/usr/src/redmine/files
+    networks:
+      - security
+      - redmine_db_net
+    security_opt:
+      - no-new-privileges:true
+
+  redmine-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: redmine
+      POSTGRES_USER: redmine
+      POSTGRES_PASSWORD: ${REDMINE_DB_PASSWORD:?Set REDMINE_DB_PASSWORD in .env}
+    volumes:
+      - redmine_db_data:/var/lib/postgresql/data
+    networks:
+      - redmine_db_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U redmine -d redmine"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Run on demand:
+  # docker compose --profile analysis run --rm joern
+  joern:
+    build:
+      context: ./infra/security/joern
+      dockerfile: Dockerfile
+    profiles:
+      - analysis
+    volumes:
+      - ${APP_SOURCE_HOST_PATH:-./workspace}:/workspace/external-app:ro
+      - ./artifacts:/workspace/artifacts
+    working_dir: /workspace
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - >-
+        joern-parse /workspace/external-app
+        --output /workspace/artifacts/cpg.bin
+        && joern --script /opt/joern/query.sc
+    networks:
+      - security
+    security_opt:
+      - no-new-privileges:true
+
+  smoke:
+    image: curlimages/curl:8.10.1
+    profiles:
+      - tools
+    environment:
+      STAGING_BASE_URL: ${STAGING_BASE_URL:-}
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - >-
+        test -n "$STAGING_BASE_URL"
+        || { echo 'Set STAGING_BASE_URL in .env'; exit 2; };
+        curl --fail --silent --show-error --max-time 15 "$STAGING_BASE_URL/"
+    networks:
+      - security
+
+networks:
+  ci:
+  security:
+  sonar_db_net:
+    internal: true
+  dojo_db_net:
+    internal: true
+  redmine_db_net:
+    internal: true
+
+volumes:
+  jenkins_home:
+  sonar_data:
+  sonar_extensions:
+  sonar_logs:
+  sonar_db_data:
+  dojo_db_data:
+  dojo_redis_data:
+  redmine_db_data:
+  redmine_files:
+  dojo_media:

@@ -1,0 +1,45 @@
+# infra/sonar/sonar-project.properties.template
+#
+# Copy this file to the root of the application source as sonar-project.properties
+# and adjust the values for your project.
+# The pipeline passes -Dsonar.projectKey and -Dsonar.token on the command line,
+# so those do not need to be set here.
+
+# --- Required ---
+sonar.projectKey=external-app
+sonar.projectName=external-app
+sonar.sources=.
+
+# --- Language-specific source/test paths (adjust as needed) ---
+# Java
+#sonar.java.binaries=target/classes
+#sonar.java.test.binaries=target/test-classes
+
+# JavaScript / TypeScript
+#sonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+# Python
+#sonar.python.coverage.reportPaths=coverage.xml
+
+# --- Exclusions ---
+sonar.exclusions=\
+  **/node_modules/**,\
+  **/vendor/**,\
+  **/*.min.js,\
+  **/dist/**,\
+  **/build/**,\
+  **/__pycache__/**
+
+sonar.test.exclusions=\
+  **/test/**,\
+  **/tests/**,\
+  **/*_test.*,\
+  **/*.test.*,\
+  **/*.spec.*
+
+# --- Coverage ---
+# Uncomment and set the correct path for your coverage report format.
+#sonar.coverage.exclusions=**/test/**,**/tests/**
+
+# --- Encoding ---
+sonar.sourceEncoding=UTF-8
