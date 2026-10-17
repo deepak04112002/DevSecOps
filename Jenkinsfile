@@ -1,4 +1,3 @@
-
 def notifyRedmineFailure(String stageName, String details = '') {
     withCredentials([
         string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
@@ -8,10 +7,19 @@ def notifyRedmineFailure(String stageName, String details = '') {
             "REDMINE_FAILURE_DETAILS=${details}"
         ]) {
             sh '''
+                set -eu
                 set +x
 
+                : "${REDMINE_PROJECT_ID:?REDMINE_PROJECT_ID is required}"
+                : "${REDMINE_TRACKER_ID:?REDMINE_TRACKER_ID is required}"
+                : "${REDMINE_STATUS_ID:?REDMINE_STATUS_ID is required}"
+                : "${REDMINE_PRIORITY_ID:?REDMINE_PRIORITY_ID is required}"
+
                 jq -n \
-                    --arg project_id "${DEFECTDOJO_PRODUCT_ID:-1}" \
+                    --argjson project_id "$REDMINE_PROJECT_ID" \
+                    --argjson tracker_id "$REDMINE_TRACKER_ID" \
+                    --argjson status_id "$REDMINE_STATUS_ID" \
+                    --argjson priority_id "$REDMINE_PRIORITY_ID" \
                     --arg stage "$REDMINE_FAILURE_STAGE" \
                     --arg details "$REDMINE_FAILURE_DETAILS" \
                     --arg job "$JOB_NAME" \
@@ -20,8 +28,9 @@ def notifyRedmineFailure(String stageName, String details = '') {
                     '{
                         issue: {
                             project_id: $project_id,
-                            tracker_id: 1,
-                            priority_id: 5,
+                            tracker_id: $tracker_id,
+                            status_id: $status_id,
+                            priority_id: $priority_id,
                             subject: ("[PIPELINE FAILURE] " + $stage + " - " + $job + " #" + $build),
                             description: (
                                 "Stage: " + $stage + "\n" +
@@ -33,7 +42,7 @@ def notifyRedmineFailure(String stageName, String details = '') {
                         }
                     }' > "$WORKSPACE/redmine-issue.json"
 
-                curl --silent --show-error --output /dev/null --max-time 5 \
+                curl --silent --show-error --output /dev/null --max-time 10 \
                     --request POST \
                     --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
                     --header "Content-Type: application/json" \
@@ -109,6 +118,12 @@ pipeline {
         SONAR_HOST_URL   = 'http://sonarqube:9000'
         DEFECTDOJO_URL   = 'http://defectdojo-nginx:8080'
         REDMINE_URL      = 'http://redmine:3000'
+
+        REDMINE_PROJECT_ID  = '1'
+        REDMINE_TRACKER_ID  = '1'
+        REDMINE_STATUS_ID   = '1'
+        REDMINE_PRIORITY_ID = '2'
+
         PYTHONUNBUFFERED = '1'
     }
 
