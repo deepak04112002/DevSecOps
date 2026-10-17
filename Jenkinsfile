@@ -1,3 +1,51 @@
+
+def notifyRedmineFailure(String stageName, String details = '') {
+    withCredentials([
+        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
+    ]) {
+        withEnv([
+            "REDMINE_FAILURE_STAGE=${stageName}",
+            "REDMINE_FAILURE_DETAILS=${details}"
+        ]) {
+            sh '''
+                set +x
+
+                jq -n \
+                    --arg project_id "${DEFECTDOJO_PRODUCT_ID:-1}" \
+                    --arg stage "$REDMINE_FAILURE_STAGE" \
+                    --arg details "$REDMINE_FAILURE_DETAILS" \
+                    --arg job "$JOB_NAME" \
+                    --arg build "$BUILD_NUMBER" \
+                    --arg url "$BUILD_URL" \
+                    '{
+                        issue: {
+                            project_id: $project_id,
+                            tracker_id: 1,
+                            priority_id: 5,
+                            subject: ("[PIPELINE FAILURE] " + $stage + " - " + $job + " #" + $build),
+                            description: (
+                                "Stage: " + $stage + "\n" +
+                                (if $details == "" then "" else $details + "\n" end) +
+                                "Job: " + $job + "\n" +
+                                "Build: #" + $build + "\n" +
+                                "URL: " + $url
+                            )
+                        }
+                    }' > "$WORKSPACE/redmine-issue.json"
+
+                curl --silent --show-error --output /dev/null --max-time 5 \
+                    --request POST \
+                    --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                    --header "Content-Type: application/json" \
+                    --data @"$WORKSPACE/redmine-issue.json" \
+                    "${REDMINE_URL}/issues.json" || true
+
+                rm -f "$WORKSPACE/redmine-issue.json"
+            '''
+        }
+    }
+}
+
 pipeline {
     agent {
         label 'devsecops-agent'
@@ -68,8 +116,9 @@ pipeline {
         stage('Checkout') {
             steps {
                 cleanWs()
+
                 script {
-                    if (params.GIT_REPOSITORY) {
+                    if (params.GIT_REPOSITORY?.trim()) {
                         git branch: params.GIT_BRANCH,
                             credentialsId: 'github-credentials',
                             url: params.GIT_REPOSITORY
@@ -77,19 +126,14 @@ pipeline {
                         checkout scm
                     }
                 }
+
                 sh 'mkdir -p artifacts'
             }
+
             post {
                 failure {
-                    withCredentials([string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Checkout - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Checkout\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure('Checkout')
                     }
                 }
             }
@@ -115,17 +159,11 @@ pipeline {
                     fi
                 '''
             }
+
             post {
                 failure {
-                    withCredentials([string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Build and Unit Tests - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Build and Unit Tests\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure('Build and Unit Tests')
                     }
                 }
             }
@@ -133,7 +171,10 @@ pipeline {
 
         stage('SonarQube SAST') {
             steps {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                catchError(
+                    buildResult: 'UNSTABLE',
+                    stageResult: 'FAILURE'
+                ) {
                     withCredentials([
                         string(
                             credentialsId: 'sonarqube-token',
@@ -154,33 +195,32 @@ pipeline {
                     }
                 }
             }
+
             post {
                 failure {
-                    withCredentials([
-                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
-                    ]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] SonarQube SAST - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: SonarQube SAST\\nQuality gate failed or scanner error.\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure(
+                            'SonarQube SAST',
+                            'Quality gate failed or scanner error.'
+                        )
                     }
                 }
             }
         }
 
-
         stage('Trivy SCA') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    string(
+                        credentialsId: 'defectdojo-api-token',
+                        variable: 'DEFECTDOJO_API_TOKEN'
+                    )
                 ]) {
                     sh '''
                         set -eu
+
                         mkdir -p artifacts/trivy
+
                         trivy fs \
                             --exit-code 0 \
                             --format json \
@@ -188,13 +228,16 @@ pipeline {
                             --scanners vuln,secret \
                             --skip-dirs .git,node_modules,artifacts \
                             .
+
                         export DEFECTDOJO_SCAN_FILE="artifacts/trivy/trivy-report.json"
                         export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
                         export DEFECTDOJO_TEST_TITLE="Trivy SCA"
+
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
+
             post {
                 always {
                     archiveArtifacts(
@@ -202,16 +245,10 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
+
                 failure {
-                    withCredentials([string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Trivy SCA - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Trivy SCA\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure('Trivy SCA')
                     }
                 }
             }
@@ -220,7 +257,10 @@ pipeline {
         stage('Joern CPG Analysis') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    string(
+                        credentialsId: 'defectdojo-api-token',
+                        variable: 'DEFECTDOJO_API_TOKEN'
+                    )
                 ]) {
                     sh '''
                         set -eu
@@ -289,10 +329,12 @@ pipeline {
                         run_parser abap '\\.abap$'
 
                         echo "Joern parsing completed."
+
                         /opt/devsecops/scripts/joern_import.sh
                     '''
                 }
             }
+
             post {
                 always {
                     archiveArtifacts(
@@ -307,6 +349,7 @@ pipeline {
             when {
                 expression { params.RUN_QUALYS }
             }
+
             steps {
                 withCredentials([
                     usernamePassword(
@@ -314,29 +357,30 @@ pipeline {
                         usernameVariable: 'QUALYS_USERNAME',
                         passwordVariable: 'QUALYS_PASSWORD'
                     ),
-                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    string(
+                        credentialsId: 'defectdojo-api-token',
+                        variable: 'DEFECTDOJO_API_TOKEN'
+                    )
                 ]) {
                     sh '''
                         set -eu
+
                         export QUALYS_REPORT_ID="${QUALYS_REPORT_ID:-}"
+
                         /opt/devsecops/scripts/qualys_export.sh
+
                         export DEFECTDOJO_SCAN_FILE="artifacts/qualys/qualys-report.xml"
                         export DEFECTDOJO_SCAN_TYPE="Qualys Scan"
+
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
+
             post {
                 failure {
-                    withCredentials([string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Qualys Export - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Qualys Export\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure('Qualys Export')
                     }
                 }
             }
@@ -345,52 +389,64 @@ pipeline {
         stage('DefectDojo Import') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
-                    string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
+                    string(
+                        credentialsId: 'defectdojo-api-token',
+                        variable: 'DEFECTDOJO_API_TOKEN'
+                    ),
+                    string(
+                        credentialsId: 'sonarqube-token',
+                        variable: 'SONAR_TOKEN'
+                    )
                 ]) {
                     sh '''
                         set -eu
+
                         mkdir -p artifacts/sonar
 
-                        # Paginate through all SonarQube issues
+                        # Paginate through all SonarQube issues.
                         page=1
                         total_pages=1
                         all_issues="[]"
+
                         while [ "$page" -le "$total_pages" ]; do
                             response="$(curl --silent --show-error --max-time 30 \
                                 --header "Authorization: Bearer ${SONAR_TOKEN}" \
                                 "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500&p=${page}&additionalFields=_all")"
+
                             total="$(echo "$response" | jq -r '.total // 0')"
                             total_pages=$(( (total + 499) / 500 ))
+
                             issues="$(echo "$response" | jq '.issues')"
-                            all_issues="$(jq -n --argjson a "$all_issues" --argjson b "$issues" '$a + $b')"
+
+                            all_issues="$(jq -n \
+                                --argjson a "$all_issues" \
+                                --argjson b "$issues" \
+                                '$a + $b')"
+
                             page=$(( page + 1 ))
                         done
 
                         jq -n \
                             --argjson issues "$all_issues" \
-                            '{"issues": $issues, "total": ($issues | length), "p": 1, "ps": ($issues | length)}' \
-                            > artifacts/sonar/sonar-report.json
+                            '{
+                                issues: $issues,
+                                total: ($issues | length),
+                                p: 1,
+                                ps: ($issues | length)
+                            }' > artifacts/sonar/sonar-report.json
 
                         export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
                         export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
+
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
+
             post {
                 failure {
-                    withCredentials([
-                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
-                    ]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] DefectDojo Import - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: DefectDojo Import\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure('DefectDojo Import')
                     }
                 }
             }
@@ -400,6 +456,7 @@ pipeline {
             when {
                 expression { params.SYNC_REDMINE }
             }
+
             steps {
                 withCredentials([
                     string(
@@ -414,17 +471,11 @@ pipeline {
                     sh '/opt/devsecops/scripts/redmine_sync.sh'
                 }
             }
+
             post {
                 failure {
-                    withCredentials([string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Redmine Sync - ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Redmine Sync\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-                        '''
+                    script {
+                        notifyRedmineFailure('Redmine Sync')
                     }
                 }
             }
@@ -435,8 +486,12 @@ pipeline {
         success {
             sh 'echo "Pipeline completed successfully. Build: #${BUILD_NUMBER}"'
         }
+
         always {
-            archiveArtifacts artifacts: 'artifacts/**', allowEmptyArchive: true
+            archiveArtifacts(
+                artifacts: 'artifacts/**',
+                allowEmptyArchive: true
+            )
         }
     }
 }
