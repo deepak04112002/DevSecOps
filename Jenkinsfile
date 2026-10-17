@@ -308,10 +308,10 @@ pipeline {
                         mkdir -p artifacts/sonar
                         curl --silent --show-error --max-time 30 \
                             --header "Authorization: Bearer ${SONAR_TOKEN}" \
-                            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500" \
+                            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500&additionalFields=_all" \
                             -o artifacts/sonar/sonar-report.json
                         export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
-                        export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
+                        export DEFECTDOJO_SCAN_TYPE="SonarQube Scan detailed"
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
