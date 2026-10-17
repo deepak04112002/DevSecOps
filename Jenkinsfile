@@ -276,7 +276,7 @@ pipeline {
                     sh '''
                         set -eu
                         export QUALYS_REPORT_ID="${QUALYS_REPORT_ID:-}"
-                        ./scripts/qualys_export.sh
+                        /opt/devsecops/scripts/qualys_export.sh
                     '''
                 }
             }
@@ -307,7 +307,7 @@ pipeline {
                     sh '''
                         set -eu
                         export DEFECTDOJO_SCAN_FILE="${DEFECTDOJO_SCAN_FILE:-artifacts/qualys/qualys-report.xml}"
-                        ./scripts/defectdojo_import.sh
+                        /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
@@ -352,7 +352,7 @@ pipeline {
                         variable: 'REDMINE_API_KEY'
                     )
                 ]) {
-                    sh './scripts/redmine_sync.sh'
+                    sh '/opt/devsecops/scripts/redmine_sync.sh'
                 }
             }
             post {
