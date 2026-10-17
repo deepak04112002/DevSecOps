@@ -67,6 +67,7 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
+                cleanWs()
                 script {
                     if (params.GIT_REPOSITORY) {
                         git branch: params.GIT_BRANCH,
