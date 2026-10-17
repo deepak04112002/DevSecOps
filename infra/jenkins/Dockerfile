@@ -26,6 +26,14 @@ RUN curl -fsSL \
        /usr/local/bin/sonar-scanner \
     && rm /tmp/sonar-scanner.zip
 
+RUN curl -fsSL https://github.com/joernio/joern/releases/latest/download/joern-install.sh \
+    -o /tmp/joern-install.sh \
+    && chmod +x /tmp/joern-install.sh \
+    && /tmp/joern-install.sh --install-dir /opt/joern --no-interactive \
+    && rm /tmp/joern-install.sh
+
+ENV PATH="/opt/joern/joern-cli:${PATH}"
+
 COPY casc/ /usr/share/jenkins/ref/casc/
 
 USER jenkins
