@@ -55,7 +55,7 @@ pipeline {
             defaultValue: true,
             description: 'Sync active findings to Redmine'
         )
-    )
+    }
 
     environment {
         SONAR_HOST_URL   = 'http://sonarqube:9000'
