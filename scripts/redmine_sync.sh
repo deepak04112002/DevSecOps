@@ -24,9 +24,10 @@ command -v jq >/dev/null || {
     exit 1
 }
 
-# Validate numeric Redmine IDs.
+# Validate positive numeric Redmine IDs.
 for var in REDMINE_PROJECT_ID REDMINE_TRACKER_ID REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
     value="${!var}"
+
     if [[ ! "$value" =~ ^[0-9]+$ ]] || (( 10#$value < 1 )); then
         echo "ERROR: $var must be a positive numeric ID." >&2
         exit 1
@@ -46,15 +47,19 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 echo "Fetching active DefectDojo findings..."
 
-curl --fail --silent --show-error 
-    --connect-timeout 15 --max-time 120 
-    --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" 
-    --header "Accept: application/json" 
-    --get 
-    --data-urlencode "active=true" 
-    --data-urlencode "limit=${REDMINE_LIMIT}" 
-    "${DEFECTDOJO_URL}/api/v2/findings/" 
-    --output "$tmpdir/findings.json"
+findings_url="${DEFECTDOJO_URL}/api/v2/findings/"
+
+# IMPORTANT: Each continued command line ends with a backslash.
+curl --fail --silent --show-error \
+    --connect-timeout 15 \
+    --max-time 120 \
+    --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
+    --header "Accept: application/json" \
+    --get \
+    --data-urlencode "active=true" \
+    --data-urlencode "limit=${REDMINE_LIMIT}" \
+    --output "$tmpdir/findings.json" \
+    "$findings_url"
 
 jq -e '.results | type == "array"' "$tmpdir/findings.json" >/dev/null || {
     echo "ERROR: Unexpected DefectDojo response; expected a .results array." >&2
@@ -74,15 +79,16 @@ while IFS= read -r finding; do
 
     subject="DD-${finding_id}: ${title}"
 
-    # Check whether an issue for this finding already exists.
+    # Search for an existing issue with this finding marker.
     curl --fail --silent --show-error \
-        --connect-timeout 15 --max-time 60 \
+        --connect-timeout 15 \
+        --max-time 60 \
         --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
         --get \
         --data-urlencode "project_id=${REDMINE_PROJECT_ID}" \
         --data-urlencode "subject=${subject}" \
-        "${REDMINE_URL}/issues.json" \
-        --output "$tmpdir/issues.json"
+        --output "$tmpdir/issues.json" \
+        "${REDMINE_URL}/issues.json"
 
     existing_count="$(jq -r '.total_count // (.issues | length) // 0' "$tmpdir/issues.json")"
 
@@ -101,7 +107,7 @@ while IFS= read -r finding; do
         issue_description+="$finding_url"
     fi
 
-    # Construct the Redmine issue request using numeric IDs.
+    # Construct the issue payload with numeric IDs.
     jq -n \
         --argjson project_id "$REDMINE_PROJECT_ID" \
         --argjson tracker_id "$REDMINE_TRACKER_ID" \
@@ -120,7 +126,7 @@ while IFS= read -r finding; do
             }
         }' > "$tmpdir/new-issue.json"
 
-    # Confirm required fields exist without printing credentials or descriptions.
+    # Validate the generated JSON before sending it.
     jq -e '
         .issue
         | (.project_id | numbers)
@@ -137,7 +143,8 @@ while IFS= read -r finding; do
 
     http_code="$(
         curl --silent --show-error \
-            --connect-timeout 15 --max-time 60 \
+            --connect-timeout 15 \
+            --max-time 60 \
             --request POST \
             --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
             --header "Content-Type: application/json" \
@@ -153,7 +160,9 @@ while IFS= read -r finding; do
     else
         echo "ERROR: Failed to create Redmine issue for finding ${finding_id} (HTTP ${http_code})." >&2
         echo "Redmine response:" >&2
-        jq . "$tmpdir/create-response.json" >&2 2>/dev/null || cat "$tmpdir/create-response.json" >&2
+        jq . "$tmpdir/create-response.json" >&2 2>/dev/null \
+            || cat "$tmpdir/create-response.json" >&2
+
         echo "Request field summary:" >&2
         jq '{
             project_id: .issue.project_id,
@@ -162,6 +171,7 @@ while IFS= read -r finding; do
             priority_id: .issue.priority_id,
             subject: .issue.subject
         }' "$tmpdir/new-issue.json" >&2
+
         exit 1
     fi
 done < "$tmpdir/findings.ndjson"

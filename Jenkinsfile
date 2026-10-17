@@ -20,8 +20,8 @@ def notifyRedmineFailure(String stageName, String details = '') {
                     --argjson tracker_id "$REDMINE_TRACKER_ID" \
                     --argjson status_id "$REDMINE_STATUS_ID" \
                     --argjson priority_id "$REDMINE_PRIORITY_ID" \
-                    --arg stage "$REDMINE_FAILURE_STAGE" \
-                    --arg details "$REDMINE_FAILURE_DETAILS" \
+                    --arg stage "${REDMINE_FAILURE_STAGE:-Unknown}" \
+                    --arg details "${REDMINE_FAILURE_DETAILS:-}" \
                     --arg job "$JOB_NAME" \
                     --arg build "$BUILD_NUMBER" \
                     --arg url "$BUILD_URL" \
