@@ -272,12 +272,16 @@ pipeline {
                         credentialsId: 'qualys-credentials',
                         usernameVariable: 'QUALYS_USERNAME',
                         passwordVariable: 'QUALYS_PASSWORD'
-                    )
+                    ),
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
                 ]) {
                     sh '''
                         set -eu
                         export QUALYS_REPORT_ID="${QUALYS_REPORT_ID:-}"
                         /opt/devsecops/scripts/qualys_export.sh
+                        export DEFECTDOJO_SCAN_FILE="artifacts/qualys/qualys-report.xml"
+                        export DEFECTDOJO_SCAN_TYPE="Qualys Scan"
+                        /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
@@ -311,7 +315,7 @@ pipeline {
                             "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500&additionalFields=_all" \
                             -o artifacts/sonar/sonar-report.json
                         export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
-                        export DEFECTDOJO_SCAN_TYPE="SonarQube Scan detailed"
+                        export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
@@ -319,8 +323,7 @@ pipeline {
             post {
                 failure {
                     withCredentials([
-                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY'),
-                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
                     ]) {
                         sh '''
                             curl --silent --output /dev/null --max-time 5 \
@@ -329,13 +332,6 @@ pipeline {
                                 --header "Content-Type: application/json" \
                                 --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] DefectDojo Import — ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: DefectDojo Import\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
                                 "${REDMINE_URL}/issues.json" || true
-
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"engagement\":${DEFECTDOJO_ENGAGEMENT_ID:-1},\"notes\":\"DefectDojo Import stage failed — ${JOB_NAME} #${BUILD_NUMBER} — ${BUILD_URL}\"}" \
-                                "${DEFECTDOJO_URL}/api/v2/notes/" || true
                         '''
                     }
                 }
