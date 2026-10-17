@@ -121,7 +121,7 @@ services:
       DD_CREDENTIAL_AES_256_KEY: ${DD_CREDENTIAL_AES_256_KEY:?Set DD_CREDENTIAL_AES_256_KEY in .env}
       DD_CELERY_BROKER_URL: redis://dojo-redis:6379/0
       DD_CACHE_URL: redis://dojo-redis:6379/1
-      DD_ALLOWED_HOSTS: "localhost,127.0.0.1,defectdojo"
+      DD_ALLOWED_HOSTS: "localhost,127.0.0.1,defectdojo,defectdojo-nginx"
       DD_DEBUG: "False"
       DD_INITIALIZE: "true"
       DD_ADMIN_USER: ${DD_ADMIN_USER:-admin}
@@ -156,7 +156,7 @@ services:
       DD_CREDENTIAL_AES_256_KEY: ${DD_CREDENTIAL_AES_256_KEY:?Set DD_CREDENTIAL_AES_256_KEY in .env}
       DD_CELERY_BROKER_URL: redis://dojo-redis:6379/0
       DD_CACHE_URL: redis://dojo-redis:6379/1
-      DD_ALLOWED_HOSTS: "localhost,127.0.0.1,defectdojo"
+      DD_ALLOWED_HOSTS: "localhost,127.0.0.1,defectdojo,defectdojo-nginx"
       DD_DEBUG: "False"
       DD_DATABASE_READINESS_TIMEOUT: "60"
     volumes:
