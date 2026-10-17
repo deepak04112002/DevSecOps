@@ -177,36 +177,86 @@ pipeline {
             }
         }
 
+
         stage('Joern CPG Analysis') {
             steps {
                 sh '''
                     set -eu
-                    joern-parse . --output artifacts/cpg.bin
-                    joern --script /opt/joern/query.sc > artifacts/joern-output.txt
+
+                    mkdir -p artifacts/joern
+                    command -v joern-parse
+
+                    # Avoid scanning dependencies and generated files.
+                    find . -type d \\( \
+                        -name node_modules -o \
+                        -name .git -o \
+                        -name target -o \
+                        -name build -o \
+                        -name dist -o \
+                        -name artifacts \
+                    \\) -prune -o -type f -print \
+                        > artifacts/joern/source-files.txt
+
+                    run_parser() {
+                        language="$1"
+                        pattern="$2"
+                        output="artifacts/joern/${language}-cpg.bin"
+                        filelist="artifacts/joern/${language}-files.txt"
+
+                        grep -Ei "$pattern" artifacts/joern/source-files.txt \
+                            > "$filelist" || true
+
+                        if [ ! -s "$filelist" ]; then
+                            echo "Skipping $language: no matching files."
+                            return 0
+                        fi
+
+                        echo "Parsing language: $language"
+
+                        # Build a clean input directory containing only
+                        # files matched for this language.
+                        input_dir="artifacts/joern/input-${language}"
+                        mkdir -p "$input_dir"
+
+                        while IFS= read -r file; do
+                            [ -f "$file" ] || continue
+                            relative="${file#./}"
+                            mkdir -p "$input_dir/$(dirname "$relative")"
+                            cp "$file" "$input_dir/$relative"
+                        done < "$filelist"
+
+                        if find "$input_dir" -type f -print -quit | grep -q .; then
+                            joern-parse \
+                                --language "$language" \
+                                --output "$output" \
+                                "$input_dir"
+                            test -s "$output"
+                        fi
+                    }
+
+                    run_parser javascript '\\.(js|jsx|mjs|cjs)$'
+                    run_parser python '\\.py$'
+                    run_parser java '\\.java$'
+                    run_parser kotlin '\\.kt$'
+                    run_parser golang '\\.go$'
+                    run_parser csharp '\\.cs$'
+                    run_parser php '\\.php$'
+                    run_parser rubysrc '\\.rb$'
+                    run_parser c '\\.c$'
+                    run_parser newc '\\.(cc|cpp|cxx|h|hpp|hh|hxx)$'
+                    run_parser rust '\\.rs$'
+                    run_parser swift '\\.swift$'
+                    run_parser abap '\\.abap$'
+
+                    echo "Joern parsing completed."
                 '''
             }
             post {
-                failure {
-                    withCredentials([
-                        string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY'),
-                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
-                    ]) {
-                        sh '''
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"issue\":{\"project_id\":\"${DEFECTDOJO_PRODUCT_ID:-1}\",\"tracker_id\":1,\"priority_id\":5,\"subject\":\"[PIPELINE FAILURE] Joern CPG Analysis \u2014 ${JOB_NAME} #${BUILD_NUMBER}\",\"description\":\"Stage: Joern CPG Analysis\\nJob: ${JOB_NAME}\\nBuild: #${BUILD_NUMBER}\\nURL: ${BUILD_URL}\"}}" \
-                                "${REDMINE_URL}/issues.json" || true
-
-                            curl --silent --output /dev/null --max-time 5 \
-                                --request POST \
-                                --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
-                                --header "Content-Type: application/json" \
-                                --data "{\"engagement\":${DEFECTDOJO_ENGAGEMENT_ID:-1},\"notes\":\"Joern CPG Analysis stage failed \u2014 ${JOB_NAME} #${BUILD_NUMBER} \u2014 ${BUILD_URL}\"}" \
-                                "${DEFECTDOJO_URL}/api/v2/notes/" || true
-                        '''
-                    }
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/joern/**',
+                        allowEmptyArchive: true
+                    )
                 }
             }
         }
