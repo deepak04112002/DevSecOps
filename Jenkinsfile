@@ -17,7 +17,7 @@ pipeline {
     parameters {
         string(
             name: 'GIT_REPOSITORY',
-            defaultValue: '',
+            defaultValue: 'https://github.com/deepak04112002/Weather-app',
             description: 'Git repository URL (leave empty to use SCM checkout)'
         )
         string(
