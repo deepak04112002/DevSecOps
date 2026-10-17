@@ -300,14 +300,18 @@ pipeline {
         stage('DefectDojo Import') {
             steps {
                 withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    )
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                    string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
                 ]) {
                     sh '''
                         set -eu
-                        export DEFECTDOJO_SCAN_FILE="${DEFECTDOJO_SCAN_FILE:-artifacts/qualys/qualys-report.xml}"
+                        mkdir -p artifacts/sonar
+                        curl --silent --show-error --max-time 30 \
+                            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+                            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500" \
+                            -o artifacts/sonar/sonar-report.json
+                        export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
+                        export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
