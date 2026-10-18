@@ -1,7 +1,7 @@
 jenkins:
   systemMessage: "Local DevSecOps lab. Do not expose publicly."
-  numExecutors: 0
-  mode: EXCLUSIVE
+  numExecutors: 2
+  mode: NORMAL
 
   securityRealm:
     local:
@@ -19,6 +19,6 @@ unclassified:
   gitHubPluginConfig:
     configs:
       - name: "GitHub"
-        apiUrl: "https://api.github.com"
+        apiUrl: "https://github.com"
         credentialsId: "github-token"
         manageHooks: true
