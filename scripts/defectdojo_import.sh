@@ -5,12 +5,11 @@ umask 077
 
 : "${DEFECTDOJO_URL:?Set DEFECTDOJO_URL}"
 : "${DEFECTDOJO_API_TOKEN:?Set DEFECTDOJO_API_TOKEN}"
-: "${DEFECTDOJO_PRODUCT_ID:?Set DEFECTDOJO_PRODUCT_ID}"
-: "${DEFECTDOJO_ENGAGEMENT_ID:?Set DEFECTDOJO_ENGAGEMENT_ID}"
+: "${DEFECTDOJO_PRODUCT_NAME:?Set DEFECTDOJO_PRODUCT_NAME}"
+: "${DEFECTDOJO_ENGAGEMENT_NAME:?Set DEFECTDOJO_ENGAGEMENT_NAME}"
 : "${DEFECTDOJO_SCAN_TYPE:?Set DEFECTDOJO_SCAN_TYPE}"
 : "${DEFECTDOJO_SCAN_FILE:?Set DEFECTDOJO_SCAN_FILE}"
 
-# Polling controls for DefectDojo background imports.
 POLL_INTERVAL_SECONDS="${DEFECTDOJO_POLL_INTERVAL_SECONDS:-5}"
 POLL_TIMEOUT_SECONDS="${DEFECTDOJO_POLL_TIMEOUT_SECONDS:-1800}"
 
@@ -18,18 +17,11 @@ command -v curl >/dev/null 2>&1 || {
     echo "ERROR: curl is required." >&2
     exit 1
 }
+
 command -v jq >/dev/null 2>&1 || {
     echo "ERROR: jq is required." >&2
     exit 1
 }
-
-for name in DEFECTDOJO_PRODUCT_ID DEFECTDOJO_ENGAGEMENT_ID; do
-    value="${!name}"
-    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: $name must be a positive integer." >&2
-        exit 1
-    fi
-done
 
 for name in POLL_INTERVAL_SECONDS POLL_TIMEOUT_SECONDS; do
     value="${!name}"
@@ -38,6 +30,16 @@ for name in POLL_INTERVAL_SECONDS POLL_TIMEOUT_SECONDS; do
         exit 1
     fi
 done
+
+[[ -n "$DEFECTDOJO_PRODUCT_NAME" ]] || {
+    echo "ERROR: DEFECTDOJO_PRODUCT_NAME is empty." >&2
+    exit 1
+}
+
+[[ -n "$DEFECTDOJO_ENGAGEMENT_NAME" ]] || {
+    echo "ERROR: DEFECTDOJO_ENGAGEMENT_NAME is empty." >&2
+    exit 1
+}
 
 [[ -f "$DEFECTDOJO_SCAN_FILE" && -s "$DEFECTDOJO_SCAN_FILE" ]] || {
     echo "ERROR: Scan file is missing, not a regular file, or empty." >&2
@@ -55,8 +57,8 @@ test_file="$tmpdir/test.json"
 
 echo "Importing scan into DefectDojo..."
 echo "Scan type: $DEFECTDOJO_SCAN_TYPE"
-echo "Product ID: $DEFECTDOJO_PRODUCT_ID"
-echo "Engagement ID: $DEFECTDOJO_ENGAGEMENT_ID"
+echo "Product: $DEFECTDOJO_PRODUCT_NAME"
+echo "Engagement: $DEFECTDOJO_ENGAGEMENT_NAME"
 echo "Test title: $TITLE"
 
 if ! http_code="$(
@@ -67,8 +69,8 @@ if ! http_code="$(
         --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
         --header "Accept: application/json" \
         --form-string "scan_type=${DEFECTDOJO_SCAN_TYPE}" \
-        --form-string "product=${DEFECTDOJO_PRODUCT_ID}" \
-        --form-string "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
+        --form-string "product_name=${DEFECTDOJO_PRODUCT_NAME}" \
+        --form-string "engagement_name=${DEFECTDOJO_ENGAGEMENT_NAME}" \
         --form-string "close_old_findings=false" \
         --form-string "minimum_severity=Info" \
         --form-string "deduplication_execution_mode=async_wait" \
@@ -79,7 +81,9 @@ if ! http_code="$(
         "${DEFECTDOJO_URL}/api/v2/reimport-scan/"
 )"; then
     echo "ERROR: DefectDojo API request failed at the transport level." >&2
-    [[ ! -f "$response_file" ]] || cat "$response_file" >&2
+    if [[ -s "$response_file" ]]; then
+        cat "$response_file" >&2
+    fi
     exit 1
 fi
 
@@ -99,8 +103,6 @@ jq -e 'type == "object"' "$response_file" >/dev/null 2>&1 || {
     exit 1
 }
 
-# Background imports return a test_id and status, not
-# deduplication_complete. Poll the test resource until it finishes.
 background_import="$(jq -r '.background_import // false' "$response_file")"
 
 if [[ "$background_import" == "true" ]]; then
@@ -132,7 +134,7 @@ if [[ "$background_import" == "true" ]]; then
 
         if [[ "$poll_code" != "200" ]]; then
             echo "ERROR: Test status request returned HTTP ${poll_code}." >&2
-            cat "$test_file" >&2
+            [[ ! -s "$test_file" ]] || cat "$test_file" >&2
             exit 1
         fi
 
@@ -172,8 +174,10 @@ if [[ "$background_import" == "true" ]]; then
 
         sleep "$POLL_INTERVAL_SECONDS"
     done
+
+    echo "DefectDojo response summary:"
+    jq '{test_id, status, processing}' "$test_file"
 else
-    # A non-background response must explicitly confirm deduplication.
     if ! jq -e '.deduplication_complete == true' \
         "$response_file" >/dev/null 2>&1; then
         echo "ERROR: Import returned, but deduplication completion was not confirmed." >&2
@@ -182,12 +186,7 @@ else
     fi
 
     echo "DefectDojo import and deduplication completed."
-fi
 
-echo "DefectDojo response summary:"
-if [[ "$background_import" == "true" ]]; then
-    jq '{test_id, status, processing}' "$test_file"
-else
     jq '{
         test,
         test_id,

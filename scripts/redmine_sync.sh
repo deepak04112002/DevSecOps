@@ -14,7 +14,6 @@ umask 077
 
 PAGE_SIZE="${PAGE_SIZE:-100}"
 
-# Closed-ticket behavior is opt-in.
 REDMINE_REOPEN_CLOSED="${REDMINE_REOPEN_CLOSED:-false}"
 REDMINE_REOPEN_STATUS_ID="${REDMINE_REOPEN_STATUS_ID:-}"
 REDMINE_CLOSED_STATUS_IDS="${REDMINE_CLOSED_STATUS_IDS:-}"
@@ -23,49 +22,53 @@ command -v curl >/dev/null 2>&1 || {
     echo "ERROR: curl is required." >&2
     exit 1
 }
+
 command -v jq >/dev/null 2>&1 || {
     echo "ERROR: jq is required." >&2
     exit 1
-
 }
 
-for var in REDMINE_PROJECT_ID REDMINE_TRACKER_ID REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
+for var in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
+           REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
     value="${!var}"
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: $var must be a positive integer without leading zeros." >&2
+        echo "ERROR: $var must be a positive integer." >&2
         exit 1
     fi
 done
 
-if [[ ! "$PAGE_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: PAGE_SIZE must be a positive integer." >&2
+if [[ ! "$PAGE_SIZE" =~ ^[1-9][0-9]*$ ]] ||
+   (( PAGE_SIZE > 1000 )); then
+    echo "ERROR: PAGE_SIZE must be between 1 and 1000." >&2
     exit 1
 fi
 
 case "$REDMINE_REOPEN_CLOSED" in
-    true|false)
-        ;;
+    true|false) ;;
     *)
         echo "ERROR: REDMINE_REOPEN_CLOSED must be true or false." >&2
         exit 1
         ;;
 esac
 
+closed_ids=()
+
 if [[ "$REDMINE_REOPEN_CLOSED" == "true" ]]; then
     if [[ ! "$REDMINE_REOPEN_STATUS_ID" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: Set REDMINE_REOPEN_STATUS_ID to a valid positive status ID when reopening is enabled." >&2
+        echo "ERROR: Set REDMINE_REOPEN_STATUS_ID to a valid positive status ID." >&2
         exit 1
     fi
 
     if [[ -z "$REDMINE_CLOSED_STATUS_IDS" ]]; then
-        echo "ERROR: Set REDMINE_CLOSED_STATUS_IDS to the closed status IDs for your Redmine instance." >&2
+        echo "ERROR: Set REDMINE_CLOSED_STATUS_IDS when reopening is enabled." >&2
         exit 1
     fi
 
     IFS=',' read -r -a closed_ids <<< "$REDMINE_CLOSED_STATUS_IDS"
+
     for id in "${closed_ids[@]}"; do
         if [[ ! "$id" =~ ^[1-9][0-9]*$ ]]; then
-            echo "ERROR: REDMINE_CLOSED_STATUS_IDS must be comma-separated positive IDs without spaces." >&2
+            echo "ERROR: REDMINE_CLOSED_STATUS_IDS must contain positive IDs without spaces." >&2
             exit 1
         fi
     done
@@ -77,8 +80,9 @@ REDMINE_URL="${REDMINE_URL%/}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-# Fetch active DefectDojo findings with pagination.
+# Fetch active findings from DefectDojo, following pagination.
 echo "Fetching active DefectDojo findings..."
+
 offset=0
 : > "$tmpdir/findings.ndjson"
 
@@ -124,14 +128,15 @@ done
 
 echo "Retrieved $(wc -l < "$tmpdir/findings.ndjson") active findings."
 
-# Locate an existing Redmine issue by the stable DefectDojo finding marker.
-# Output: issue_id<TAB>status_id
+# Find an existing Redmine issue by the stable subject prefix.
+# Output format: issue_id<TAB>status_id
 find_existing_issue() {
     local marker="$1"
     local offset=0
     local total=0
     local code
     local found
+    local fetched
 
     while :; do
         if ! code="$(
@@ -171,10 +176,7 @@ find_existing_issue() {
                 [
                     .issues[]
                     | select((.subject // "") | startswith($marker))
-                    | [
-                        (.id | tostring),
-                        (.status.id | tostring)
-                    ]
+                    | [(.id | tostring), (.status.id | tostring)]
                 ]
                 | first // empty
                 | @tsv
@@ -196,15 +198,12 @@ find_existing_issue() {
     return 1
 }
 
-# Reopen a matching issue only if its current status is configured as closed.
 reopen_issue_if_configured() {
     local issue_id="$1"
     local current_status_id="$2"
     local marker="$3"
     local closed_match=false
     local closed_id
-    local payload_file="$tmpdir/reopen-issue.json"
-    local response_file="$tmpdir/reopen-response.json"
     local code
 
     [[ "$REDMINE_REOPEN_CLOSED" == "true" ]] || return 0
@@ -220,11 +219,11 @@ reopen_issue_if_configured() {
 
     jq -n \
         --argjson status_id "$REDMINE_REOPEN_STATUS_ID" \
-        --arg notes "Reopened automatically because the associated active DefectDojo finding (${marker}) is present again." \
+        --arg notes "Reopened automatically because active DefectDojo finding ${marker} is present again." \
         '{issue: {status_id: $status_id, notes: $notes}}' \
-        > "$payload_file"
+        > "$tmpdir/reopen-issue.json"
 
-    echo "Reopening closed Redmine issue #${issue_id} for ${marker}..."
+    echo "Reopening Redmine issue #${issue_id} for ${marker}..."
 
     if ! code="$(
         curl --silent --show-error \
@@ -233,8 +232,8 @@ reopen_issue_if_configured() {
             --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
             --header "Content-Type: application/json" \
             --header "Accept: application/json" \
-            --data @"$payload_file" \
-            --output "$response_file" \
+            --data @"$tmpdir/reopen-issue.json" \
+            --output "$tmpdir/reopen-response.json" \
             --write-out '%{http_code}' \
             "${REDMINE_URL}/issues/${issue_id}.json"
     )"; then
@@ -244,7 +243,7 @@ reopen_issue_if_configured() {
 
     if [[ "$code" != "200" && "$code" != "204" ]]; then
         echo "ERROR: Reopening issue #${issue_id} failed (HTTP ${code})." >&2
-        cat "$response_file" >&2
+        cat "$tmpdir/reopen-response.json" >&2
         return 1
     fi
 
@@ -256,10 +255,12 @@ reused=0
 reopened=0
 failed=0
 
-while IFS= read -r finding; do
+while IFS= read -r finding || [[ -n "$finding" ]]; do
+    [[ -n "$finding" ]] || continue
+
     finding_id="$(jq -r '.id // empty' <<<"$finding")"
 
-    if [[ ! "$finding_id" =~ ^[0-9]+$ ]]; then
+    if [[ ! "$finding_id" =~ ^[1-9][0-9]*$ ]]; then
         echo "WARNING: Skipping finding with invalid ID." >&2
         continue
     fi
@@ -267,12 +268,97 @@ while IFS= read -r finding; do
     title="$(jq -r '.title // .name // "Security finding"' <<<"$finding")"
     severity="$(jq -r '.severity // "Unknown"' <<<"$finding")"
     description="$(jq -r '.description // "No description provided."' <<<"$finding")"
-    finding_url="$(jq -r '.url // empty' <<<"$finding")"
+    mitigation="$(jq -r '.mitigation // "No remediation guidance supplied."' <<<"$finding")"
+    impact="$(jq -r '.impact // "Impact not specified."' <<<"$finding")"
+    file_path="$(jq -r '.file_path // .component_name // "Not specified"' <<<"$finding")"
+    line_number="$(jq -r '.line // "Not specified"' <<<"$finding")"
+    component_version="$(jq -r '.component_version // "Not specified"' <<<"$finding")"
+
+    cwe="$(jq -r '
+        if .cwe == null or .cwe == "" then
+            "Not specified"
+        else
+            (.cwe | tostring)
+        end
+    ' <<<"$finding")"
+
+    cve_list="$(jq -r '
+        (.vulnerability_ids // [])
+        | if type == "array" then
+            map(
+                if type == "object" then
+                    (.vulnerability_id // .name // .value // empty)
+                else
+                    tostring
+                end
+            )
+            | map(select(length > 0))
+            | unique
+            | join(", ")
+          else
+            tostring
+          end
+    ' <<<"$finding")"
+
+    [[ -n "$cve_list" ]] || cve_list="Not specified"
+
+    scanner="$(jq -r '
+        (.found_by // [])
+        | if type == "array" then
+            map(
+                if type == "object" then
+                    (.name // .display_name // .id // tostring)
+                else
+                    tostring
+                end
+            ) | join(", ")
+          else
+            tostring
+          end
+    ' <<<"$finding")"
+
+    [[ -n "$scanner" && "$scanner" != "null" ]] || scanner="Not specified"
+
+    finding_url="${DEFECTDOJO_URL}/finding/${finding_id}"
 
     marker="DD-${finding_id}:"
-    subject="${marker} ${title}"
+
+    # Keep the stable marker at the beginning so lookup finds the ticket.
+    subject="${marker} [${severity^^}] ${title}"
+
+    issue_description="$(
+        printf '%s\n' \
+            "SECURITY FINDING" \
+            "================" \
+            "" \
+            "DefectDojo Finding ID: ${finding_id}" \
+            "Severity: ${severity}" \
+            "Scanner: ${scanner}" \
+            "Affected file/component: ${file_path}" \
+            "Line: ${line_number}" \
+            "Component version: ${component_version}" \
+            "CWE: ${cwe}" \
+            "CVE / vulnerability IDs: ${cve_list}" \
+            "" \
+            "DESCRIPTION" \
+            "-----------" \
+            "$description" \
+            "" \
+            "IMPACT" \
+            "------" \
+            "$impact" \
+            "" \
+            "RECOMMENDED REMEDIATION" \
+            "-----------------------" \
+            "$mitigation" \
+            "" \
+            "DEFECTDOJO FINDING" \
+            "------------------" \
+            "$finding_url"
+    )"
 
     existing_record=""
+
     if existing_record="$(find_existing_issue "$marker")"; then
         IFS=$'\t' read -r existing_id existing_status_id <<< "$existing_record"
 
@@ -284,7 +370,6 @@ while IFS= read -r finding; do
 
         echo "Reusing Redmine issue #${existing_id} for finding ${finding_id}."
 
-        # Check the configured closed statuses before attempting any update.
         was_closed=false
         if [[ "$REDMINE_REOPEN_CLOSED" == "true" ]]; then
             for closed_id in "${closed_ids[@]}"; do
@@ -295,7 +380,8 @@ while IFS= read -r finding; do
             done
         fi
 
-        if ! reopen_issue_if_configured "$existing_id" "$existing_status_id" "$marker"; then
+        if ! reopen_issue_if_configured \
+            "$existing_id" "$existing_status_id" "$marker"; then
             failed=$((failed + 1))
             exit 1
         fi
@@ -314,16 +400,7 @@ while IFS= read -r finding; do
         fi
     fi
 
-    issue_description="$(
-        printf 'Imported from DefectDojo finding #%s\nSeverity: %s\n\n%s' \
-            "$finding_id" "$severity" "$description"
-    )"
-
-    if [[ -n "$finding_url" ]]; then
-        issue_description+=$'\n\nDefectDojo: '
-        issue_description+="$finding_url"
-    fi
-
+    # Use the detailed description above; do not overwrite it here.
     jq -n \
         --argjson project_id "$REDMINE_PROJECT_ID" \
         --argjson tracker_id "$REDMINE_TRACKER_ID" \

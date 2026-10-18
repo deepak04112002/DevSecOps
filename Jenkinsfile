@@ -1,96 +1,117 @@
-
 def notifyRedmineFailure(String stageName, String details = '') {
     withCredentials([
         string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
     ]) {
         withEnv([
             "REDMINE_FAILURE_STAGE=${stageName}",
-            "REDMINE_FAILURE_DETAILS=${details}"
+            "REDMINE_FAILURE_DETAILS=${details}",
+            "REDMINE_FAILURE_COMMIT=${env.GIT_COMMIT ?: 'Unknown'}"
         ]) {
-            sh '''
-                set -eu
-                set +x
-                umask 077
+            int notifyStatus = sh(
+                returnStatus: true,
+                script: '''
+                    set -eu
+                    set +x
+                    umask 077
 
-                : "${REDMINE_URL:?REDMINE_URL is required}"
-                : "${REDMINE_PROJECT_ID:?REDMINE_PROJECT_ID is required}"
-                : "${REDMINE_TRACKER_ID:?REDMINE_TRACKER_ID is required}"
-                : "${REDMINE_STATUS_ID:?REDMINE_STATUS_ID is required}"
-                : "${REDMINE_PRIORITY_ID:?REDMINE_PRIORITY_ID is required}"
-                : "${REDMINE_API_KEY:?Redmine API key is required}"
+                    : "${REDMINE_URL:?REDMINE_URL is required}"
+                    : "${REDMINE_API_KEY:?Redmine API key is required}"
 
-                command -v jq >/dev/null
-                command -v curl >/dev/null
+                    command -v jq >/dev/null 2>&1 || {
+                        echo "WARNING: jq is unavailable; cannot create Redmine notification." >&2
+                        exit 1
+                    }
 
-                tmpdir="$(mktemp -d)"
-                trap 'rm -rf "$tmpdir"' EXIT
+                    command -v curl >/dev/null 2>&1 || {
+                        echo "WARNING: curl is unavailable; cannot create Redmine notification." >&2
+                        exit 1
+                    }
 
-                for name in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
-                            REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
-                    value="$(printenv "$name")"
-                    if ! printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'; then
-                        echo "ERROR: Invalid $name" >&2
+                    for name in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
+                                REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
+                        value="$(printenv "$name" 2>/dev/null || true)"
+                        if ! printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'; then
+                            echo "WARNING: Invalid $name; skipping failure notification." >&2
+                            exit 1
+                        fi
+                    done
+
+                    tmpdir="$(mktemp -d)"
+                    trap 'rm -rf "$tmpdir"' EXIT
+
+                    jq -n \
+                        --argjson project_id "$REDMINE_PROJECT_ID" \
+                        --argjson tracker_id "$REDMINE_TRACKER_ID" \
+                        --argjson status_id "$REDMINE_STATUS_ID" \
+                        --argjson priority_id "$REDMINE_PRIORITY_ID" \
+                        --arg stage "${REDMINE_FAILURE_STAGE:-Unknown}" \
+                        --arg details "${REDMINE_FAILURE_DETAILS:-No additional details were supplied.}" \
+                        --arg job "${JOB_NAME:-Unknown}" \
+                        --arg build "${BUILD_NUMBER:-Unknown}" \
+                        --arg url "${BUILD_URL:-Unavailable}" \
+                        --arg commit "${REDMINE_FAILURE_COMMIT:-Unknown}" \
+                        '{
+                            issue: {
+                                project_id: $project_id,
+                                tracker_id: $tracker_id,
+                                status_id: $status_id,
+                                priority_id: $priority_id,
+                                subject: (
+                                    "[PIPELINE FAILURE] " + $stage +
+                                    " - " + $job + " #" + $build
+                                ),
+                                description: (
+                                    "PIPELINE FAILURE REPORT\\n" +
+                                    "=======================\\n\\n" +
+                                    "Failed stage: " + $stage + "\\n" +
+                                    "Job: " + $job + "\\n" +
+                                    "Build: #" + $build + "\\n" +
+                                    "Git commit: " + $commit + "\\n" +
+                                    "Build URL: " + $url + "\\n\\n" +
+                                    "FAILURE DETAILS\\n" +
+                                    "---------------\\n" + $details + "\\n\\n" +
+                                    "INVESTIGATION CHECKLIST\\n" +
+                                    "-----------------------\\n" +
+                                    "1. Open the Jenkins build URL.\\n" +
+                                    "2. Inspect the failed stage and console output.\\n" +
+                                    "3. Review the relevant scanner report or API response.\\n" +
+                                    "4. Correct the root cause and rerun the pipeline.\\n"
+                                )
+                            }
+                        }' > "$tmpdir/issue.json"
+
+                    if ! code="$(
+                        curl --silent --show-error \
+                            --connect-timeout 5 --max-time 15 \
+                            --request POST \
+                            --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                            --header "Content-Type: application/json" \
+                            --header "Accept: application/json" \
+                            --data @"$tmpdir/issue.json" \
+                            --output "$tmpdir/response.json" \
+                            --write-out '%{http_code}' \
+                            "${REDMINE_URL%/}/issues.json"
+                    )"; then
+                        echo "WARNING: Redmine notification request failed." >&2
                         exit 1
                     fi
-                done
 
-                jq -n \
-                    --argjson project_id "$REDMINE_PROJECT_ID" \
-                    --argjson tracker_id "$REDMINE_TRACKER_ID" \
-                    --argjson status_id "$REDMINE_STATUS_ID" \
-                    --argjson priority_id "$REDMINE_PRIORITY_ID" \
-                    --arg stage "${REDMINE_FAILURE_STAGE:-Unknown}" \
-                    --arg details "${REDMINE_FAILURE_DETAILS:-}" \
-                    --arg job "${JOB_NAME:-Unknown}" \
-                    --arg build "${BUILD_NUMBER:-Unknown}" \
-                    --arg url "${BUILD_URL:-}" \
-                    '{
-                        issue: {
-                            project_id: $project_id,
-                            tracker_id: $tracker_id,
-                            status_id: $status_id,
-                            priority_id: $priority_id,
-                            subject: (
-                                "[PIPELINE FAILURE] " + $stage +
-                                " - " + $job + " #" + $build
-                            ),
-                            description: (
-                                "Stage: " + $stage + "\n" +
-                                (if $details == "" then "" else
-                                    $details + "\n"
-                                end) +
-                                "Job: " + $job + "\n" +
-                                "Build: #" + $build + "\n" +
-                                "URL: " + $url
-                            )
-                        }
-                    }' > "$tmpdir/issue.json"
+                    if [ "$code" = "201" ] &&
+                       jq -e '.issue.id | numbers' "$tmpdir/response.json" >/dev/null 2>&1; then
+                        issue_id="$(jq -r '.issue.id' "$tmpdir/response.json")"
+                        echo "Redmine failure ticket created: #${issue_id}"
+                    else
+                        echo "WARNING: Redmine notification failed (HTTP ${code})." >&2
+                        jq . "$tmpdir/response.json" >&2 2>/dev/null ||
+                            cat "$tmpdir/response.json" >&2 || true
+                        exit 1
+                    fi
+                '''
+            )
 
-                if ! code="$(
-                    curl --silent --show-error \
-                        --connect-timeout 5 --max-time 15 \
-                        --request POST \
-                        --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                        --header "Content-Type: application/json" \
-                        --header "Accept: application/json" \
-                        --data @"$tmpdir/issue.json" \
-                        --output "$tmpdir/response.json" \
-                        --write-out '%{http_code}' \
-                        "${REDMINE_URL%/}/issues.json"
-                )"; then
-                    echo "WARNING: Redmine failure notification request failed." >&2
-                    exit 0
-                fi
-
-                if [ "$code" = "201" ] &&
-                   jq -e '.issue.id | numbers' "$tmpdir/response.json" >/dev/null 2>&1; then
-                    echo "Redmine failure notification created."
-                else
-                    echo "WARNING: Redmine notification failed (HTTP $code)." >&2
-                    jq . "$tmpdir/response.json" >&2 2>/dev/null ||
-                        cat "$tmpdir/response.json" >&2 || true
-                fi
-            '''
+            if (notifyStatus != 0) {
+                echo "WARNING: Could not create the Redmine failure ticket for stage: ${stageName}"
+            }
         }
     }
 }
@@ -126,16 +147,6 @@ pipeline {
             name: 'SONAR_PROJECT_KEY',
             defaultValue: 'external-app',
             description: 'SonarQube project key'
-        )
-        string(
-            name: 'DEFECTDOJO_PRODUCT_ID',
-            defaultValue: '1',
-            description: 'Existing DefectDojo product ID'
-        )
-        string(
-            name: 'DEFECTDOJO_ENGAGEMENT_ID',
-            defaultValue: '1',
-            description: 'Existing DefectDojo engagement ID'
         )
         booleanParam(
             name: 'RUN_QUALYS',
@@ -174,10 +185,8 @@ pipeline {
         SONAR_PROJECT_KEY = "${params.SONAR_PROJECT_KEY}"
 
         DEFECTDOJO_URL = 'http://defectdojo-nginx:8080'
-        DEFECTDOJO_PRODUCT_ID = "${params.DEFECTDOJO_PRODUCT_ID}"
-        DEFECTDOJO_ENGAGEMENT_ID = "${params.DEFECTDOJO_ENGAGEMENT_ID}"
-
-        // Background-import polling in defectdojo_import.sh.
+        DEFECTDOJO_PRODUCT_NAME = 'DevSecOps Pipeline'
+        DEFECTDOJO_ENGAGEMENT_NAME = 'CI Pipeline'
         DEFECTDOJO_POLL_INTERVAL_SECONDS = '5'
         DEFECTDOJO_POLL_TIMEOUT_SECONDS = '1800'
 
@@ -187,7 +196,6 @@ pipeline {
         REDMINE_STATUS_ID = '1'
         REDMINE_PRIORITY_ID = '2'
 
-        // Safe default: don't reopen closed tickets.
         REDMINE_REOPEN_CLOSED = "${params.REOPEN_CLOSED_REDMINE_TICKETS}"
         REDMINE_REOPEN_STATUS_ID = "${params.REDMINE_REOPEN_STATUS_ID}"
         REDMINE_CLOSED_STATUS_IDS = "${params.REDMINE_CLOSED_STATUS_IDS}"
@@ -201,7 +209,23 @@ pipeline {
                 sh '''
                     set -eu
 
-                    for name in DEFECTDOJO_PRODUCT_ID DEFECTDOJO_ENGAGEMENT_ID; do
+                    : "${DEFECTDOJO_URL:?Set DEFECTDOJO_URL}"
+                    : "${DEFECTDOJO_PRODUCT_NAME:?Set DEFECTDOJO_PRODUCT_NAME}"
+                    : "${DEFECTDOJO_ENGAGEMENT_NAME:?Set DEFECTDOJO_ENGAGEMENT_NAME}"
+                    : "${REDMINE_URL:?Set REDMINE_URL}"
+
+                    [ -n "$DEFECTDOJO_PRODUCT_NAME" ] || {
+                        echo "ERROR: DefectDojo product name is empty." >&2
+                        exit 1
+                    }
+
+                    [ -n "$DEFECTDOJO_ENGAGEMENT_NAME" ] || {
+                        echo "ERROR: DefectDojo engagement name is empty." >&2
+                        exit 1
+                    }
+
+                    for name in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
+                                REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
                         value="$(printenv "$name")"
                         if ! printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'; then
                             echo "ERROR: $name must be a positive integer." >&2
@@ -235,6 +259,17 @@ pipeline {
                     echo "Configuration validation passed."
                 '''
             }
+
+            post {
+                failure {
+                    script {
+                        notifyRedmineFailure(
+                            'Validate Configuration',
+                            'Configuration validation failed. Review the Jenkins console for the invalid or missing setting.'
+                        )
+                    }
+                }
+            }
         }
 
         stage('Checkout') {
@@ -257,7 +292,10 @@ pipeline {
             post {
                 failure {
                     script {
-                        notifyRedmineFailure('Checkout')
+                        notifyRedmineFailure(
+                            'Checkout',
+                            'Git checkout failed. Check the repository URL, branch name, GitHub credentials, and Jenkins network access.'
+                        )
                     }
                 }
             }
@@ -287,7 +325,10 @@ pipeline {
             post {
                 failure {
                     script {
-                        notifyRedmineFailure('Build and Unit Tests')
+                        notifyRedmineFailure(
+                            'Build and Unit Tests',
+                            'Build or unit tests failed. Review the build-tool output, dependency installation, and test failures in the Jenkins console.'
+                        )
                     }
                 }
             }
@@ -325,7 +366,7 @@ pipeline {
                     script {
                         notifyRedmineFailure(
                             'SonarQube SAST',
-                            'Quality gate failed or scanner error.'
+                            'SonarScanner failed or the SonarQube Quality Gate did not pass. Review the scanner output and the SonarQube project dashboard to determine which occurred.'
                         )
                     }
                 }
@@ -372,7 +413,10 @@ pipeline {
 
                 failure {
                     script {
-                        notifyRedmineFailure('Trivy SCA')
+                        notifyRedmineFailure(
+                            'Trivy SCA',
+                            'Trivy scanning or the DefectDojo import failed. Inspect artifacts/trivy/trivy-report.json and the Jenkins console for the scanner or API error.'
+                        )
                     }
                 }
             }
@@ -451,9 +495,8 @@ pipeline {
 
                         export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
 
-                        # This script must create a supported findings report
-                        # and set DEFECTDOJO_SCAN_FILE and DEFECTDOJO_SCAN_TYPE
-                        # before calling defectdojo_import.sh.
+                        # joern_import.sh must generate a supported report and
+                        # export DEFECTDOJO_SCAN_FILE and DEFECTDOJO_SCAN_TYPE.
                         /opt/devsecops/scripts/joern_import.sh
                     '''
                 }
@@ -469,7 +512,10 @@ pipeline {
 
                 failure {
                     script {
-                        notifyRedmineFailure('Joern CPG Analysis')
+                        notifyRedmineFailure(
+                            'Joern CPG Analysis',
+                            'Joern parsing, report generation, or DefectDojo import failed. Review artifacts/joern/ and the Jenkins console.'
+                        )
                     }
                 }
             }
@@ -519,7 +565,10 @@ pipeline {
 
                 failure {
                     script {
-                        notifyRedmineFailure('Qualys Export')
+                        notifyRedmineFailure(
+                            'Qualys Export',
+                            'Qualys report export or DefectDojo import failed. Verify the report ID, Qualys credentials, report file, and API response.'
+                        )
                     }
                 }
             }
@@ -607,7 +656,10 @@ pipeline {
 
                 failure {
                     script {
-                        notifyRedmineFailure('DefectDojo Import - SonarQube')
+                        notifyRedmineFailure(
+                            'DefectDojo Import - SonarQube',
+                            'The SonarQube issue export or DefectDojo import failed. Inspect the SonarQube API response, artifacts/sonar/sonar-report.json, and DefectDojo API error.'
+                        )
                     }
                 }
             }
@@ -636,7 +688,10 @@ pipeline {
             post {
                 failure {
                     script {
-                        notifyRedmineFailure('Redmine Sync')
+                        notifyRedmineFailure(
+                            'Redmine Sync',
+                            'The DefectDojo-to-Redmine synchronization failed. Review the Redmine API response, finding data, and redmine_sync.sh console output.'
+                        )
                     }
                 }
             }
