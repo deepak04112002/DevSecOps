@@ -1,3 +1,4 @@
+
 def notifyRedmineFailure(String stageName, String details = '') {
     withCredentials([
         string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
@@ -9,11 +10,29 @@ def notifyRedmineFailure(String stageName, String details = '') {
             sh '''
                 set -eu
                 set +x
+                umask 077
 
+                : "${REDMINE_URL:?REDMINE_URL is required}"
                 : "${REDMINE_PROJECT_ID:?REDMINE_PROJECT_ID is required}"
                 : "${REDMINE_TRACKER_ID:?REDMINE_TRACKER_ID is required}"
                 : "${REDMINE_STATUS_ID:?REDMINE_STATUS_ID is required}"
                 : "${REDMINE_PRIORITY_ID:?REDMINE_PRIORITY_ID is required}"
+                : "${REDMINE_API_KEY:?Redmine API key is required}"
+
+                command -v jq >/dev/null
+                command -v curl >/dev/null
+
+                tmpdir="$(mktemp -d)"
+                trap 'rm -rf "$tmpdir"' EXIT
+
+                for name in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
+                            REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
+                    value="$(printenv "$name")"
+                    if ! printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'; then
+                        echo "ERROR: Invalid $name" >&2
+                        exit 1
+                    fi
+                done
 
                 jq -n \
                     --argjson project_id "$REDMINE_PROJECT_ID" \
@@ -22,34 +41,55 @@ def notifyRedmineFailure(String stageName, String details = '') {
                     --argjson priority_id "$REDMINE_PRIORITY_ID" \
                     --arg stage "${REDMINE_FAILURE_STAGE:-Unknown}" \
                     --arg details "${REDMINE_FAILURE_DETAILS:-}" \
-                    --arg job "$JOB_NAME" \
-                    --arg build "$BUILD_NUMBER" \
-                    --arg url "$BUILD_URL" \
+                    --arg job "${JOB_NAME:-Unknown}" \
+                    --arg build "${BUILD_NUMBER:-Unknown}" \
+                    --arg url "${BUILD_URL:-}" \
                     '{
                         issue: {
                             project_id: $project_id,
                             tracker_id: $tracker_id,
                             status_id: $status_id,
                             priority_id: $priority_id,
-                            subject: ("[PIPELINE FAILURE] " + $stage + " - " + $job + " #" + $build),
+                            subject: (
+                                "[PIPELINE FAILURE] " + $stage +
+                                " - " + $job + " #" + $build
+                            ),
                             description: (
                                 "Stage: " + $stage + "\n" +
-                                (if $details == "" then "" else $details + "\n" end) +
+                                (if $details == "" then "" else
+                                    $details + "\n"
+                                end) +
                                 "Job: " + $job + "\n" +
                                 "Build: #" + $build + "\n" +
                                 "URL: " + $url
                             )
                         }
-                    }' > "$WORKSPACE/redmine-issue.json"
+                    }' > "$tmpdir/issue.json"
 
-                curl --silent --show-error --output /dev/null --max-time 10 \
-                    --request POST \
-                    --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                    --header "Content-Type: application/json" \
-                    --data @"$WORKSPACE/redmine-issue.json" \
-                    "${REDMINE_URL}/issues.json" || true
+                if ! code="$(
+                    curl --silent --show-error \
+                        --connect-timeout 5 --max-time 15 \
+                        --request POST \
+                        --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                        --header "Content-Type: application/json" \
+                        --header "Accept: application/json" \
+                        --data @"$tmpdir/issue.json" \
+                        --output "$tmpdir/response.json" \
+                        --write-out '%{http_code}' \
+                        "${REDMINE_URL%/}/issues.json"
+                )"; then
+                    echo "WARNING: Redmine failure notification request failed." >&2
+                    exit 0
+                fi
 
-                rm -f "$WORKSPACE/redmine-issue.json"
+                if [ "$code" = "201" ] &&
+                   jq -e '.issue.id | numbers' "$tmpdir/response.json" >/dev/null 2>&1; then
+                    echo "Redmine failure notification created."
+                else
+                    echo "WARNING: Redmine notification failed (HTTP $code)." >&2
+                    jq . "$tmpdir/response.json" >&2 2>/dev/null ||
+                        cat "$tmpdir/response.json" >&2 || true
+                fi
             '''
         }
     }
@@ -112,22 +152,91 @@ pipeline {
             defaultValue: true,
             description: 'Sync active findings to Redmine'
         )
+        booleanParam(
+            name: 'REOPEN_CLOSED_REDMINE_TICKETS',
+            defaultValue: false,
+            description: 'Reopen matching closed Redmine tickets when findings are active again'
+        )
+        string(
+            name: 'REDMINE_REOPEN_STATUS_ID',
+            defaultValue: '',
+            description: 'Redmine status ID to use when reopening tickets; required if reopening is enabled'
+        )
+        string(
+            name: 'REDMINE_CLOSED_STATUS_IDS',
+            defaultValue: '',
+            description: 'Comma-separated Redmine closed status IDs; required if reopening is enabled'
+        )
     }
 
     environment {
-        SONAR_HOST_URL   = 'http://sonarqube:9000'
-        DEFECTDOJO_URL   = 'http://defectdojo-nginx:8080'
-        REDMINE_URL      = 'http://redmine:3000'
+        SONAR_HOST_URL = 'http://sonarqube:9000'
+        SONAR_PROJECT_KEY = "${params.SONAR_PROJECT_KEY}"
 
-        REDMINE_PROJECT_ID  = '1'
-        REDMINE_TRACKER_ID  = '1'
-        REDMINE_STATUS_ID   = '1'
+        DEFECTDOJO_URL = 'http://defectdojo-nginx:8080'
+        DEFECTDOJO_PRODUCT_ID = "${params.DEFECTDOJO_PRODUCT_ID}"
+        DEFECTDOJO_ENGAGEMENT_ID = "${params.DEFECTDOJO_ENGAGEMENT_ID}"
+
+        // Background-import polling in defectdojo_import.sh.
+        DEFECTDOJO_POLL_INTERVAL_SECONDS = '5'
+        DEFECTDOJO_POLL_TIMEOUT_SECONDS = '1800'
+
+        REDMINE_URL = 'http://redmine:3000'
+        REDMINE_PROJECT_ID = '1'
+        REDMINE_TRACKER_ID = '1'
+        REDMINE_STATUS_ID = '1'
         REDMINE_PRIORITY_ID = '2'
+
+        // Safe default: don't reopen closed tickets.
+        REDMINE_REOPEN_CLOSED = "${params.REOPEN_CLOSED_REDMINE_TICKETS}"
+        REDMINE_REOPEN_STATUS_ID = "${params.REDMINE_REOPEN_STATUS_ID}"
+        REDMINE_CLOSED_STATUS_IDS = "${params.REDMINE_CLOSED_STATUS_IDS}"
 
         PYTHONUNBUFFERED = '1'
     }
 
     stages {
+        stage('Validate Configuration') {
+            steps {
+                sh '''
+                    set -eu
+
+                    for name in DEFECTDOJO_PRODUCT_ID DEFECTDOJO_ENGAGEMENT_ID; do
+                        value="$(printenv "$name")"
+                        if ! printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'; then
+                            echo "ERROR: $name must be a positive integer." >&2
+                            exit 1
+                        fi
+                    done
+
+                    if [ "$REDMINE_REOPEN_CLOSED" = "true" ]; then
+                        if ! printf '%s' "$REDMINE_REOPEN_STATUS_ID" |
+                             grep -Eq '^[1-9][0-9]*$'; then
+                            echo "ERROR: Set a valid REDMINE_REOPEN_STATUS_ID." >&2
+                            exit 1
+                        fi
+
+                        if [ -z "$REDMINE_CLOSED_STATUS_IDS" ]; then
+                            echo "ERROR: Set REDMINE_CLOSED_STATUS_IDS when reopening is enabled." >&2
+                            exit 1
+                        fi
+
+                        old_ifs="$IFS"
+                        IFS=','
+                        for id in $REDMINE_CLOSED_STATUS_IDS; do
+                            if ! printf '%s' "$id" | grep -Eq '^[1-9][0-9]*$'; then
+                                echo "ERROR: Closed status IDs must be comma-separated positive integers without spaces." >&2
+                                exit 1
+                            fi
+                        done
+                        IFS="$old_ifs"
+                    fi
+
+                    echo "Configuration validation passed."
+                '''
+            }
+        }
+
         stage('Checkout') {
             steps {
                 cleanWs()
@@ -169,7 +278,7 @@ pipeline {
                         npm test
                     else
                         echo "No supported build detected."
-                        echo "Add your application's build and test commands."
+                        echo "Add the application's build and test commands."
                         exit 2
                     fi
                 '''
@@ -281,9 +390,8 @@ pipeline {
                         set -eu
 
                         mkdir -p artifacts/joern
-                        command -v joern-parse
+                        command -v joern-parse >/dev/null
 
-                        # Avoid scanning dependencies and generated files.
                         find . -type d \\( \
                             -name node_modules -o \
                             -name .git -o \
@@ -307,8 +415,6 @@ pipeline {
                                 echo "Skipping $language: no matching files."
                                 return 0
                             fi
-
-                            echo "Parsing language: $language"
 
                             input_dir="artifacts/joern/input-${language}"
                             mkdir -p "$input_dir"
@@ -343,8 +449,11 @@ pipeline {
                         run_parser swift '\\.swift$'
                         run_parser abap '\\.abap$'
 
-                        echo "Joern parsing completed."
+                        export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
 
+                        # This script must create a supported findings report
+                        # and set DEFECTDOJO_SCAN_FILE and DEFECTDOJO_SCAN_TYPE
+                        # before calling defectdojo_import.sh.
                         /opt/devsecops/scripts/joern_import.sh
                     '''
                 }
@@ -356,6 +465,12 @@ pipeline {
                         artifacts: 'artifacts/joern/**',
                         allowEmptyArchive: true
                     )
+                }
+
+                failure {
+                    script {
+                        notifyRedmineFailure('Joern CPG Analysis')
+                    }
                 }
             }
         }
@@ -380,12 +495,14 @@ pipeline {
                     sh '''
                         set -eu
 
+                        mkdir -p artifacts/qualys
                         export QUALYS_REPORT_ID="${QUALYS_REPORT_ID:-}"
 
                         /opt/devsecops/scripts/qualys_export.sh
 
                         export DEFECTDOJO_SCAN_FILE="artifacts/qualys/qualys-report.xml"
                         export DEFECTDOJO_SCAN_TYPE="Qualys Scan"
+                        export DEFECTDOJO_TEST_TITLE="Qualys Vulnerability Scan"
 
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
@@ -393,6 +510,13 @@ pipeline {
             }
 
             post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/qualys/**',
+                        allowEmptyArchive: true
+                    )
+                }
+
                 failure {
                     script {
                         notifyRedmineFailure('Qualys Export')
@@ -401,7 +525,7 @@ pipeline {
             }
         }
 
-        stage('DefectDojo Import') {
+        stage('DefectDojo Import - SonarQube') {
             steps {
                 withCredentials([
                     string(
@@ -417,28 +541,40 @@ pipeline {
                         set -eu
 
                         mkdir -p artifacts/sonar
-
-                        # Paginate through all SonarQube issues.
                         page=1
                         total_pages=1
                         all_issues="[]"
 
                         while [ "$page" -le "$total_pages" ]; do
-                            response="$(curl --silent --show-error --max-time 30 \
-                                --header "Authorization: Bearer ${SONAR_TOKEN}" \
-                                "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500&p=${page}&additionalFields=_all")"
+                            response="$(
+                                curl --fail --silent --show-error \
+                                    --connect-timeout 10 --max-time 60 \
+                                    --header "Authorization: Bearer ${SONAR_TOKEN}" \
+                                    --get \
+                                    --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
+                                    --data-urlencode "resolved=false" \
+                                    --data-urlencode "ps=500" \
+                                    --data-urlencode "p=${page}" \
+                                    --data-urlencode "additionalFields=_all" \
+                                    "${SONAR_HOST_URL}/api/issues/search"
+                            )"
 
-                            total="$(echo "$response" | jq -r '.total // 0')"
+                            echo "$response" |
+                                jq -e '(.issues | type == "array") and (.total | type == "number")' \
+                                >/dev/null
+
+                            total="$(echo "$response" | jq -r '.total')"
                             total_pages=$(( (total + 499) / 500 ))
 
                             issues="$(echo "$response" | jq '.issues')"
+                            all_issues="$(
+                                jq -n \
+                                    --argjson a "$all_issues" \
+                                    --argjson b "$issues" \
+                                    '$a + $b'
+                            )"
 
-                            all_issues="$(jq -n \
-                                --argjson a "$all_issues" \
-                                --argjson b "$issues" \
-                                '$a + $b')"
-
-                            page=$(( page + 1 ))
+                            page=$((page + 1))
                         done
 
                         jq -n \
@@ -450,8 +586,11 @@ pipeline {
                                 ps: ($issues | length)
                             }' > artifacts/sonar/sonar-report.json
 
+                        test -s artifacts/sonar/sonar-report.json
+
                         export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
                         export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
+                        export DEFECTDOJO_TEST_TITLE="SonarQube SAST"
 
                         /opt/devsecops/scripts/defectdojo_import.sh
                     '''
@@ -459,9 +598,16 @@ pipeline {
             }
 
             post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/sonar/**',
+                        allowEmptyArchive: true
+                    )
+                }
+
                 failure {
                     script {
-                        notifyRedmineFailure('DefectDojo Import')
+                        notifyRedmineFailure('DefectDojo Import - SonarQube')
                     }
                 }
             }
@@ -499,7 +645,15 @@ pipeline {
 
     post {
         success {
-            sh 'echo "Pipeline completed successfully. Build: #${BUILD_NUMBER}"'
+            echo "Pipeline completed successfully. Build: #${env.BUILD_NUMBER}"
+        }
+
+        unstable {
+            echo "Pipeline completed with unstable status. Build: #${env.BUILD_NUMBER}"
+        }
+
+        failure {
+            echo "Pipeline failed. Build: #${env.BUILD_NUMBER}"
         }
 
         always {
