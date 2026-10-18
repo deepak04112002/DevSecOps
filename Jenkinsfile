@@ -185,6 +185,8 @@ pipeline {
         SONAR_PROJECT_KEY = "${params.SONAR_PROJECT_KEY}"
 
         DEFECTDOJO_URL = 'http://defectdojo-nginx:8080'
+        DEFECTDOJO_PRODUCT_ID='1'
+        DEFECTDOJO_ENGAGEMENT_ID = '1'
         DEFECTDOJO_PRODUCT_NAME = 'DevSecOps Pipeline'
         DEFECTDOJO_ENGAGEMENT_NAME = 'CI Pipeline'
         DEFECTDOJO_POLL_INTERVAL_SECONDS = '5'
