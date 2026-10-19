@@ -1,7 +1,7 @@
+
 #!/usr/bin/env bash
 # scripts/joern_import.sh
-# Converts Joern query results (SARIF or plain text) to Generic Findings Import
-# format and pushes them to DefectDojo.
+# Normalize Joern results and import them into DefectDojo.
 set -Eeuo pipefail
 umask 077
 
@@ -13,86 +13,205 @@ umask 077
 JOERN_RESULTS_DIR="${JOERN_RESULTS_DIR:-artifacts/joern}"
 OUT_FILE="${JOERN_RESULTS_DIR}/joern-findings.json"
 
-command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || {
+    echo "ERROR: jq is required." >&2
+    exit 1
+}
 
-# Collect all .txt result files produced by joern queries (not file lists).
-# joern-parse produces .bin files; actual query output is written as .txt or
-# .json by the query script. We look for any non-empty .json result files
-# first, then fall back to .txt files.
+[[ -d "$JOERN_RESULTS_DIR" ]] || {
+    echo "ERROR: Results directory not found: $JOERN_RESULTS_DIR" >&2
+    exit 1
+}
+
+mkdir -p "$(dirname "$OUT_FILE")"
+
+# Find supported result files. Exclude our generated output.
 mapfile -t result_files < <(
-    find "$JOERN_RESULTS_DIR" -maxdepth 1 \
-        \( -name "*.sarif" -o -name "*-results.json" -o -name "*-findings.txt" \) \
-        -not -empty 2>/dev/null || true
+    find "$JOERN_RESULTS_DIR" -maxdepth 1 -type f \
+        \( -name "*.sarif" \
+        -o -name "*.json" \
+        -o -name "*-findings.txt" \) \
+        ! -path "$OUT_FILE" \
+        ! -name "*.bin" \
+        -size +0c -print |
+    sort
 )
 
 if [[ ${#result_files[@]} -eq 0 ]]; then
-    echo "No Joern query result files found in ${JOERN_RESULTS_DIR} — skipping import."
-    exit 0
+    echo "ERROR: No non-empty Joern result files found in $JOERN_RESULTS_DIR" >&2
+    exit 1
 fi
 
-# Build a Generic Findings Import JSON from all result files.
-# Each line in a findings .txt file becomes one finding.
-findings_json="[]"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
 
-for result_file in "${result_files[@]}"; do
-    ext="${result_file##*.}"
+# Normalize one source file at a time.
+for i in "${!result_files[@]}"; do
+    result_file="${result_files[$i]}"
+    normalized="$tmp_dir/$i.json"
 
-    if [[ "$ext" == "sarif" ]]; then
-        # SARIF format — extract results array directly
-        sarif_findings="$(
-            jq '[
-                .runs[].results[] |
-                {
-                    title: (.ruleId // "Joern Finding"),
-                    severity: "Medium",
-                    description: (.message.text // ""),
-                    file_path: (.locations[0].physicalLocation.artifactLocation.uri // ""),
-                    line: (.locations[0].physicalLocation.region.startLine // 1)
-                }
-            ]' "$result_file" 2>/dev/null || echo "[]"
-        )"
-        findings_json="$(jq -n --argjson a "$findings_json" --argjson b "$sarif_findings" '$a + $b')"
+    echo "Processing: $result_file" >&2
 
-    elif [[ "$ext" == "json" ]]; then
-        # Generic JSON array of findings
-        json_findings="$(
-            jq '[.[] | {
-                title: (.title // .name // "Joern Finding"),
-                severity: (.severity // "Medium"),
-                description: (.description // .detail // ""),
-                file_path: (.file // .filePath // ""),
-                line: (.line // .lineNumber // 1)
-            }]' "$result_file" 2>/dev/null || echo "[]"
-        )"
-        findings_json="$(jq -n --argjson a "$findings_json" --argjson b "$json_findings" '$a + $b')"
+    case "$result_file" in
+        *.sarif)
+            jq -e '
+                if (.runs | type) != "array" then
+                    error("Invalid SARIF: missing runs array")
+                else
+                    [
+                        .runs[]?.results[]? |
+                        {
+                            title: (
+                                .message.text //
+                                .ruleId //
+                                "Joern Finding"
+                            ),
+                            rule_id: (.ruleId // ""),
+                            severity: (
+                                if .level == "error" then "High"
+                                elif .level == "warning" then "Medium"
+                                else "Low" end
+                            ),
+                            description: (.message.text // ""),
+                            file_path: (
+                                .locations[0].physicalLocation
+                                    .artifactLocation.uri // ""
+                            ),
+                            line: (
+                                .locations[0].physicalLocation
+                                    .region.startLine // 1
+                            ),
+                            code: (
+                                .locations[0].physicalLocation
+                                    .region.snippet.text // ""
+                            )
+                        }
+                    ]
+                end
+            ' "$result_file" > "$normalized"
+            ;;
 
-    else
-        # Plain text — each non-empty line is a finding title
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            findings_json="$(
-                jq -n \
-                    --argjson existing "$findings_json" \
-                    --arg title "$line" \
-                    '$existing + [{"title": $title, "severity": "Medium", "description": $title, "file_path": "", "line": 1}]'
-            )"
-        done < "$result_file"
-    fi
+        *.json)
+            # Supports:
+            #   [...]
+            #   {"findings": [...]}
+            #   {"runs": [...]} (SARIF-like JSON)
+            #   A single finding object.
+            jq -e '
+                def records:
+                    if type == "array" then .
+                    elif (.findings | type) == "array" then .findings
+                    elif (.runs | type) == "array" then
+                        [.runs[]?.results[]?]
+                    elif (
+                        has("title") or has("name") or
+                        has("ruleId") or has("rule_id") or
+                        has("description") or has("file_path")
+                    ) then [.]
+                    else error("Unsupported JSON finding structure")
+                    end;
+
+                records |
+                map({
+                    title: (
+                        .title // .name // .ruleId //
+                        .rule_id // "Joern Finding"
+                    ),
+                    rule_id: (.rule_id // .ruleId // ""),
+                    severity: (
+                        .severity //
+                        (if .level == "error" then "High"
+                         elif .level == "warning" then "Medium"
+                         else "Low" end)
+                    ),
+                    description: (
+                        .description //
+                        .detail //
+                        .message.text //
+                        .message //
+                        ""
+                    ),
+                    file_path: (
+                        .file_path //
+                        .filePath //
+                        .file //
+                        .locations[0].physicalLocation
+                            .artifactLocation.uri //
+                        ""
+                    ),
+                    line: (
+                        .line //
+                        .lineNumber //
+                        .locations[0].physicalLocation
+                            .region.startLine //
+                        1
+                    ),
+                    code: (
+                        .code //
+                        .snippet //
+                        .locations[0].physicalLocation
+                            .region.snippet.text //
+                        ""
+                    )
+                })
+            ' "$result_file" > "$normalized"
+            ;;
+
+        *.txt)
+            # One non-empty line per finding; text has no reliable location.
+            jq -Rn '
+                [
+                    inputs |
+                    select(test("\\S")) |
+                    {
+                        title: .,
+                        rule_id: "",
+                        severity: "Medium",
+                        description: .,
+                        file_path: "",
+                        line: 1,
+                        code: ""
+                    }
+                ]
+            ' < "$result_file" > "$normalized"
+            ;;
+
+        *)
+            continue
+            ;;
+    esac
+
+    jq -e 'type == "array"' "$normalized" >/dev/null || {
+        echo "ERROR: Invalid normalized results from $result_file" >&2
+        exit 1
+    }
 done
 
-finding_count="$(jq 'length' <<< "$findings_json")"
+# Combine all normalized result arrays.
+jq -s 'add' "$tmp_dir"/*.json > "$tmp_dir/combined.json"
+
+# Deduplicate identical rule/title/location findings.
+jq '
+    unique_by([
+        .rule_id,
+        .title,
+        .file_path,
+        (.line | tostring)
+    ])
+    | {findings: .}
+' "$tmp_dir/combined.json" > "$OUT_FILE"
+
+finding_count="$(jq '.findings | length' "$OUT_FILE")"
+
 if [[ "$finding_count" -eq 0 ]]; then
-    echo "Joern produced no findings to import."
+    echo "No Joern findings to import."
     exit 0
 fi
 
-# Wrap into Generic Findings Import envelope
-jq -n --argjson findings "$findings_json" \
-    '{"findings": $findings}' > "$OUT_FILE"
-
-echo "Importing ${finding_count} Joern finding(s) into DefectDojo..."
+echo "Importing $finding_count Joern finding(s) into DefectDojo..."
 
 export DEFECTDOJO_SCAN_FILE="$OUT_FILE"
 export DEFECTDOJO_SCAN_TYPE="Generic Findings Import"
 export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
+
 /opt/devsecops/scripts/defectdojo_import.sh
