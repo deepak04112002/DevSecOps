@@ -612,6 +612,13 @@ pipeline {
 
         // -------------------------------------------------------------------
         // 6. Joern CPG Analysis — code property graph SAST → DefectDojo
+        //
+        // Three steps per language:
+        //   a. joern-parse  — build the CPG (.bin) from source files
+        //   b. joern --script query.sc  — run security queries against the
+        //      CPG and write *-results.json into artifacts/joern/
+        //   c. joern_import.sh  — convert result files to Generic Findings
+        //      Import format and push to DefectDojo
         // -------------------------------------------------------------------
         stage('Joern CPG Analysis') {
             steps {
@@ -624,6 +631,7 @@ pipeline {
 
                             mkdir -p artifacts/joern
                             command -v joern-parse >/dev/null
+                            command -v joern       >/dev/null
 
                             find . -type d \\( \
                                 -name node_modules -o \
@@ -635,11 +643,15 @@ pipeline {
                             \\) -prune -o -type f -print \
                                 > artifacts/joern/source-files.txt
 
+                            # -------------------------------------------------
+                            # run_parser: build CPG then run security queries
+                            # -------------------------------------------------
                             run_parser() {
                                 language="$1"
                                 pattern="$2"
-                                output="artifacts/joern/${language}-cpg.bin"
+                                cpg_bin="artifacts/joern/${language}-cpg.bin"
                                 filelist="artifacts/joern/${language}-files.txt"
+                                results_file="artifacts/joern/${language}-results.json"
 
                                 grep -Ei "$pattern" artifacts/joern/source-files.txt \
                                     > "$filelist" || true
@@ -659,12 +671,46 @@ pipeline {
                                     cp "$file" "$input_dir/$relative"
                                 done < "$filelist"
 
-                                if find "$input_dir" -type f -print -quit | grep -q .; then
-                                    joern-parse \
-                                        --language "$language" \
-                                        --output   "$output" \
-                                        "$input_dir"
-                                    test -s "$output"
+                                if ! find "$input_dir" -type f -print -quit | grep -q .; then
+                                    echo "No files staged for $language — skipping."
+                                    return 0
+                                fi
+
+                                # Step a: build CPG
+                                echo "Building CPG for $language..."
+                                joern-parse \
+                                    --language "$language" \
+                                    --output   "$cpg_bin" \
+                                    "$input_dir"
+                                test -s "$cpg_bin" || {
+                                    echo "WARNING: CPG for $language is empty — skipping queries."
+                                    return 0
+                                }
+
+                                # Step b: pick language-specific script, fall back to generic
+                                query_dir="/opt/devsecops/infra/security/joern"
+                                # rubysrc language uses the ruby script
+                                script_lang="$language"
+                                [ "$script_lang" = "rubysrc" ] && script_lang="ruby"
+                                # newc (C++) reuses the c script
+                                [ "$script_lang" = "newc"    ] && script_lang="c"
+                                # kotlin reuses the java CPG model but has its own script
+                                query_script="${query_dir}/query_${script_lang}.sc"
+                                if [ ! -f "$query_script" ]; then
+                                    echo "No specific query script for $language — using generic."
+                                    query_script="${query_dir}/query_generic.sc"
+                                fi
+
+                                echo "Running security queries on $language CPG (${query_script##*/})..."
+                                joern --script "$query_script" \
+                                    --param "cpgFile=$(pwd)/${cpg_bin}" \
+                                    --param "outFile=$(pwd)/${results_file}" \
+                                    || echo "WARNING: Joern query script exited non-zero for $language."
+
+                                if [ -s "$results_file" ]; then
+                                    echo "$language: query results written to $results_file"
+                                else
+                                    echo "$language: no findings from queries."
                                 fi
                             }
 
@@ -682,10 +728,8 @@ pipeline {
                             run_parser swift       '\\.swift$'
                             run_parser abap        '\\.abap$'
 
+                            # Step c: import all result files into DefectDojo
                             export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
-
-                            # joern_import.sh must produce a supported report
-                            # and export DEFECTDOJO_SCAN_FILE + DEFECTDOJO_SCAN_TYPE.
                             /opt/devsecops/scripts/joern_import.sh
                         '''
                     }
@@ -751,7 +795,37 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 8. Redmine Sync
+        // 8. Security Report (PDF)
+        //
+        // Fetches all active DefectDojo findings, builds a styled HTML report
+        // grouped by severity and scanner, then converts it to PDF via
+        // weasyprint. The PDF is archived as a Jenkins artifact.
+        // Stage failure is non-blocking (catchError UNSTABLE) so a missing
+        // weasyprint or rendering issue never breaks the pipeline.
+        // -------------------------------------------------------------------
+        stage('Security Report (PDF)') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh 'bash /opt/devsecops/scripts/generate_report.sh'
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/report/**',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 9. Redmine Sync
         //
         // Pulls every active finding from DefectDojo (all scanners combined),
         // builds a consolidated report grouped by scanner and severity, then

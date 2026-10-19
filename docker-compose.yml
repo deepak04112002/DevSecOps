@@ -26,6 +26,7 @@ services:
       - ${APP_SOURCE_HOST_PATH:-./workspace}:/workspace/external-app:ro
       - ./artifacts:/workspace/artifacts
       - ./scripts:/opt/devsecops/scripts:ro
+      - ./infra:/opt/devsecops/infra:ro
     networks:
       - ci
       - security

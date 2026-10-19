@@ -10,11 +10,19 @@ RUN apt-get update \
        gnupg \
        jq \
        python3 \
+       python3-pip \
        python3-requests \
+       libpango-1.0-0 \
+       libpangocairo-1.0-0 \
+       libcairo2 \
+       libgdk-pixbuf-xlib-2.0-0 \
+       shared-mime-info \
+       fonts-dejavu-core \
        unzip \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages --no-cache-dir weasyprint
 
 # Trivy — SCA and filesystem vulnerability scanning
 RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
