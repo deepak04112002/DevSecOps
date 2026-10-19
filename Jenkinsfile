@@ -398,7 +398,7 @@ pipeline {
                         export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
                         export DEFECTDOJO_TEST_TITLE="Trivy SCA"
 
-                        bash scripts/defectdojo_import.sh
+                        bash /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
@@ -550,7 +550,7 @@ pipeline {
                         export DEFECTDOJO_SCAN_TYPE="Qualys Scan"
                         export DEFECTDOJO_TEST_TITLE="Qualys Vulnerability Scan"
 
-                        bash scripts/defectdojo_import.sh
+                        bash /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
@@ -641,7 +641,7 @@ pipeline {
                         export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
                         export DEFECTDOJO_TEST_TITLE="SonarQube SAST"
 
-                        bash scripts/defectdojo_import.sh
+                        bash /opt/devsecops/scripts/defectdojo_import.sh
                     '''
                 }
             }
