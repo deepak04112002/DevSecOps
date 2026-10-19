@@ -825,30 +825,6 @@ pipeline {
             }
         }
 
-
-        // a central security policy gate to your existing Jenkins pipeline. It will check findings from all scanners in DefectDojo and decide whether the build passes or fails, instead of relying only on Trivy's exit code.
-
-        // Your desired policy will be:
-        // - CRITICAL, HIGH, or MEDIUM findings: fail immediately.
-        // - Any detected secret: fail immediately.
-        // - New LOW vulnerability: pass and record it.
-        // - Previously seen LOW vulnerability found again in a later build: fail.
-        // - Scan or DefectDojo import failure: fail.
-        
-        stage('Security Policy Gate') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    )
-                ]) {
-                    sh 'bash /opt/devsecops/scripts/defectdojo_policy_gate.sh'
-                }
-            }
-        }
-
-
         // -------------------------------------------------------------------
         // 9. Redmine Sync
         //
@@ -887,6 +863,31 @@ pipeline {
             }
         }
     }
+
+
+        //10: a central security policy gate to your existing Jenkins pipeline. It will check findings from all scanners in DefectDojo and decide whether the build passes or fails, instead of relying only on Trivy's exit code.
+
+        // Your desired policy will be:
+        // - CRITICAL, HIGH, or MEDIUM findings: fail immediately.
+        // - Any detected secret: fail immediately.
+        // - New LOW vulnerability: pass and record it.
+        // - Previously seen LOW vulnerability found again in a later build: fail.
+        // - Scan or DefectDojo import failure: fail.
+        
+        stage('Security Policy Gate') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'defectdojo-api-token',
+                        variable: 'DEFECTDOJO_API_TOKEN'
+                    )
+                ]) {
+                    sh 'bash /opt/devsecops/scripts/defectdojo_policy_gate.sh'
+                }
+            }
+        }
+
+
 
     // -----------------------------------------------------------------------
     // Global post actions
