@@ -769,7 +769,7 @@ pipeline {
 
                             # Step c: import all result files into DefectDojo
                             export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
-                            /opt/devsecops/scripts/joern_import.sh
+                            bash /opt/devsecops/scripts/joern_import.sh
                         '''
                     }
                 }
