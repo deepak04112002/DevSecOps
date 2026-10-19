@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
 # scripts/redmine_sync.sh
+#
+# Consolidates every active DefectDojo finding for the engagement into a
+# SINGLE Redmine ticket per pipeline job, so the team follows one living
+# ticket instead of one ticket per finding (or per failing stage).
+#
+# Each pipeline run:
+#   * pulls every active finding from DefectDojo,
+#   * groups them by scanner/test and severity into a consolidated report,
+#   * creates the ticket the first time, then on every later run updates
+#     the SAME ticket: the description is replaced with the latest full
+#     report, and a short per-build summary is appended as a note so the
+#     ticket becomes a running history.
+#
+# DefectDojo stays the per-finding source of truth; this ticket is the
+# rollup the team watches.
 set -Eeuo pipefail
 umask 077
 
@@ -13,10 +28,13 @@ umask 077
 : "${REDMINE_PRIORITY_ID:?Set REDMINE_PRIORITY_ID}"
 
 PAGE_SIZE="${PAGE_SIZE:-100}"
-
 REDMINE_REOPEN_CLOSED="${REDMINE_REOPEN_CLOSED:-false}"
 REDMINE_REOPEN_STATUS_ID="${REDMINE_REOPEN_STATUS_ID:-}"
 REDMINE_CLOSED_STATUS_IDS="${REDMINE_CLOSED_STATUS_IDS:-}"
+
+# Optional: used to map each finding to the scanner/test that produced it
+# (test_id -> test_title) and to link the DefectDojo engagement.
+DEFECTDOJO_ENGAGEMENT_ID="${DEFECTDOJO_ENGAGEMENT_ID:-}"
 
 command -v curl >/dev/null 2>&1 || {
     echo "ERROR: curl is required." >&2
@@ -80,11 +98,14 @@ REDMINE_URL="${REDMINE_URL%/}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-# Fetch active findings from DefectDojo, following pagination.
+# ---------------------------------------------------------------------------
+# 1. Fetch every active DefectDojo finding (paginate).
+# ---------------------------------------------------------------------------
 echo "Fetching active DefectDojo findings..."
 
+ndjson="$tmpdir/findings.ndjson"
+: > "$ndjson"
 offset=0
-: > "$tmpdir/findings.ndjson"
 
 while :; do
     if ! code="$(
@@ -117,7 +138,7 @@ while :; do
     }
 
     count="$(jq -r '.count' "$tmpdir/dd-page.json")"
-    jq -c '.results[]' "$tmpdir/dd-page.json" >> "$tmpdir/findings.ndjson"
+    jq -c '.results[]' "$tmpdir/dd-page.json" >> "$ndjson"
 
     fetched="$(jq '.results | length' "$tmpdir/dd-page.json")"
     (( fetched > 0 )) || break
@@ -126,321 +147,307 @@ while :; do
     (( offset < count )) || break
 done
 
-echo "Retrieved $(wc -l < "$tmpdir/findings.ndjson") active findings."
+findings_file="$tmpdir/findings.json"
+jq -s '.' "$ndjson" > "$findings_file"
+findings_count="$(jq 'length' "$findings_file")"
+echo "Retrieved ${findings_count} active findings."
 
-# Find an existing Redmine issue by the stable subject prefix.
-# Output format: issue_id<TAB>status_id
-find_existing_issue() {
-    local marker="$1"
-    local offset=0
-    local total=0
-    local code
-    local found
-    local fetched
+# ---------------------------------------------------------------------------
+# 2. Fetch the engagement's tests so each finding can be grouped by the
+#    scanner/test that produced it (test_id -> test_title).
+# ---------------------------------------------------------------------------
+tests_file="$tmpdir/tests.json"
+echo '{"results":[]}' > "$tests_file"
 
-    while :; do
-        if ! code="$(
-            curl --silent --show-error \
-                --connect-timeout 15 --max-time 60 \
-                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
-                --header "Accept: application/json" \
-                --get \
-                --data-urlencode "project_id=${REDMINE_PROJECT_ID}" \
-                --data-urlencode "status_id=*" \
-                --data-urlencode "limit=${PAGE_SIZE}" \
-                --data-urlencode "offset=${offset}" \
-                --output "$tmpdir/issues.json" \
-                --write-out '%{http_code}' \
-                "${REDMINE_URL}/issues.json"
-        )"; then
-            echo "ERROR: Redmine issue lookup failed at the transport level." >&2
-            return 2
+if [[ "$DEFECTDOJO_ENGAGEMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
+    if tcode="$(
+        curl --silent --show-error \
+            --connect-timeout 15 --max-time 60 \
+            --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
+            --header "Accept: application/json" \
+            --get \
+            --data-urlencode "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
+            --data-urlencode "limit=200" \
+            --output "$tests_file" \
+            --write-out '%{http_code}' \
+            "${DEFECTDOJO_URL}/api/v2/tests/"
+    )"; then
+        if [[ "$tcode" != "200" ]]; then
+            echo "WARNING: DefectDojo tests list returned HTTP ${tcode}; scanner names may fall back to test IDs." >&2
+            echo '{"results":[]}' > "$tests_file"
         fi
+    else
+        echo "WARNING: Could not fetch DefectDojo tests list; scanner names may fall back to test IDs." >&2
+        echo '{"results":[]}' > "$tests_file"
+    fi
+else
+    echo "WARNING: DEFECTDOJO_ENGAGEMENT_ID is not set; scanner grouping will use 'found_by' or 'Unspecified'." >&2
+fi
 
-        if [[ "$code" != "200" ]]; then
-            echo "ERROR: Redmine issue lookup returned HTTP $code." >&2
-            cat "$tmpdir/issues.json" >&2
-            return 2
-        fi
+# ---------------------------------------------------------------------------
+# 3. Build the consolidated report (description) and per-build summary (note).
+# ---------------------------------------------------------------------------
+job="${JOB_NAME:-Unknown}"
+build="${BUILD_NUMBER:-Unknown}"
+generated="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+if [[ "$DEFECTDOJO_ENGAGEMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
+    engagement_url="${DEFECTDOJO_URL}/engagement/${DEFECTDOJO_ENGAGEMENT_ID}"
+else
+    engagement_url="${DEFECTDOJO_URL}"
+fi
 
-        jq -e '(.issues | type == "array") and (.total_count | type == "number")' \
-            "$tmpdir/issues.json" >/dev/null || {
-            echo "ERROR: Invalid Redmine issues response." >&2
-            return 2
-        }
-
-        total="$(jq -r '.total_count' "$tmpdir/issues.json")"
-
-        found="$(
-            jq -r --arg marker "$marker" '
-                [
-                    .issues[]
-                    | select((.subject // "") | startswith($marker))
-                    | [(.id | tostring), (.status.id | tostring)]
+report_file="$tmpdir/report.json"
+jq -n \
+    --slurpfile findings "$findings_file" \
+    --slurpfile tests "$tests_file" \
+    --arg job "$job" \
+    --arg build "$build" \
+    --arg generated "$generated" \
+    --arg engagement_url "$engagement_url" \
+    '
+    ($findings[0]) as $fs
+    | ($tests[0].results // []) as $tr
+    | ( $tr
+        | map({
+            key: (.id | tostring),
+            value: (.test_title // "Unknown test" | if . == "" then "Unknown test" else . end)
+          })
+        | from_entries
+      ) as $tmap
+    | ( $fs | map(
+        . as $f
+        | ( $tmap[($f.test | tostring)] // "" ) as $map_test
+        | ( if $map_test != "" then $map_test
+            else (
+              ($f.found_by // [])
+              | map(if type == "object" then (.name // .display_name // (.id | tostring)) else tostring end)
+              | join(", ")
+            )
+            end
+          ) as $scanner_raw
+        | {
+            id: $f.id,
+            title: ($f.title // $f.name // "Security finding"),
+            severity: ($f.severity // "Unknown"),
+            scanner: (if $scanner_raw == "" then "Unspecified" else $scanner_raw end),
+            file_path: ($f.file_path // $f.component_name // "Not specified"),
+            line_number: ($f.line // "Not specified"),
+            component_version: ($f.component_version // "Not specified"),
+            cwe: (if $f.cwe == null or $f.cwe == "" then "Not specified" else ($f.cwe | tostring) end),
+            cves: (
+              ( ($f.vulnerability_ids // [])
+                | map(if type == "object" then (.vulnerability_id // .name // .value // empty) else tostring end)
+                | map(select(length > 0)) | unique | join(", ")
+              ) | if . == "" then "Not specified" else . end
+            )
+          }
+      ) ) as $a
+    | ( $a | length ) as $total
+    | ( $a | group_by(.severity) | map({key: .[0].severity, value: length}) | from_entries ) as $by_sev
+    | ( $a | group_by(.scanner) | map({key: .[0].scanner, value: length}) | from_entries ) as $by_sc
+    | ( $a | group_by(.scanner) | map(.[0].scanner) ) as $scanners
+    | {
+        total: $total,
+        report: (
+          [ "CONSOLIDATED SECURITY REPORT\n",
+            "=============================\n\n",
+            ("Job: " + $job + "\n"),
+            ("Build: #" + $build + "\n"),
+            ("Generated: " + $generated + "\n"),
+            ("DefectDojo engagement: " + $engagement_url + "\n"),
+            ("Total active findings: " + ($total | tostring) + "\n\n")
+          ]
+          + ( if $total > 0 then
+                [ "BY SEVERITY\n-----------\n",
+                  ($by_sev | to_entries | sort_by(.key) | map("  " + .key + ": " + (.value | tostring) + "\n") | join("")),
+                  "\nBY SCANNER\n----------\n",
+                  ($by_sc | to_entries | sort_by(.key) | map("  " + .key + ": " + (.value | tostring) + "\n") | join("")),
+                  "\n"
                 ]
-                | first // empty
-                | @tsv
-            ' "$tmpdir/issues.json"
-        )"
+                + ( $scanners | sort_by(.)
+                    | [ .[] | . as $s
+                        | ( "\n[" + $s + "]\n"
+                            + ( [ $a | map(select(.scanner == $s)) | sort_by(.severity) | .[]
+                                  | ("  #" + (.id | tostring) + " [" + .severity + "] " + .title + "\n"
+                                     + "    File/component: " + .file_path + ":" + (.line_number | tostring) + "\n"
+                                     + "    Component version: " + .component_version + "\n"
+                                     + "    CWE: " + .cwe + "\n"
+                                     + "    CVE / vulnerability IDs: " + .cves + "\n")
+                                ] | join("")
+                            )
+                          )
+                      ]
+                  )
+              else
+                [ "No active findings. DefectDojo engagement is clean.\n" ]
+              end
+            )
+          | join("")
+        ),
+        note: (
+          if $total == 0 then
+            ("Build #" + $build + " (" + $generated + "): 0 active findings - all clear.")
+          else
+            ( "Build #" + $build + " (" + $generated + "): " + ($total | tostring) + " active findings - "
+              + ( $by_sev | to_entries | sort_by(.key) | map(.key + ":" + (.value | tostring)) | join(", ") )
+              + ". "
+              + ( $by_sc | to_entries | sort_by(.key) | map(.key + ":" + (.value | tostring)) | join(", ") )
+              + "." )
+          end
+        )
+      }
+    ' > "$report_file"
 
-        if [[ -n "$found" ]]; then
-            printf '%s\n' "$found"
-            return 0
-        fi
+report_total="$(jq -r '.total' "$report_file")"
+report="$(jq -r '.report' "$report_file")"
+note="$(jq -r '.note' "$report_file")"
 
-        fetched="$(jq '.issues | length' "$tmpdir/issues.json")"
-        (( fetched > 0 )) || break
+# ---------------------------------------------------------------------------
+# 4. Find the existing consolidated ticket for this job (stable marker).
+# ---------------------------------------------------------------------------
+marker="DD-CONSOLIDATED-REPORT: ${job}"
+subject="${marker} - ${report_total} active findings (build #${build})"
 
-        offset=$((offset + fetched))
-        (( offset < total )) || break
-    done
+existing_id=""
+existing_status_id=""
+offset=0
+rm_total=0
 
-    return 1
-}
+while :; do
+    if ! rcode="$(
+        curl --silent --show-error \
+            --connect-timeout 15 --max-time 60 \
+            --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+            --header "Accept: application/json" \
+            --get \
+            --data-urlencode "project_id=${REDMINE_PROJECT_ID}" \
+            --data-urlencode "status_id=*" \
+            --data-urlencode "limit=${PAGE_SIZE}" \
+            --data-urlencode "offset=${offset}" \
+            --output "$tmpdir/issues.json" \
+            --write-out '%{http_code}' \
+            "${REDMINE_URL}/issues.json"
+    )"; then
+        echo "ERROR: Redmine issue lookup failed at the transport level." >&2
+        exit 1
+    fi
 
-reopen_issue_if_configured() {
-    local issue_id="$1"
-    local current_status_id="$2"
-    local marker="$3"
-    local closed_match=false
-    local closed_id
-    local code
+    if [[ "$rcode" != "200" ]]; then
+        echo "ERROR: Redmine issue lookup returned HTTP $rcode." >&2
+        cat "$tmpdir/issues.json" >&2
+        exit 1
+    fi
 
-    [[ "$REDMINE_REOPEN_CLOSED" == "true" ]] || return 0
+    jq -e '(.issues | type == "array") and (.total_count | type == "number")' \
+        "$tmpdir/issues.json" >/dev/null || {
+        echo "ERROR: Invalid Redmine issues response." >&2
+        exit 1
+    }
 
-    for closed_id in "${closed_ids[@]}"; do
-        if [[ "$current_status_id" == "$closed_id" ]]; then
-            closed_match=true
-            break
-        fi
-    done
+    rm_total="$(jq -r '.total_count' "$tmpdir/issues.json")"
 
-    [[ "$closed_match" == "true" ]] || return 0
+    found="$(jq -r --arg marker "$marker" '
+        [ .issues[]
+          | select((.subject // "") | startswith($marker))
+          | [(.id | tostring), (.status.id | tostring)]
+        ] | first // empty | @tsv
+    ' "$tmpdir/issues.json")"
 
-    jq -n \
-        --argjson status_id "$REDMINE_REOPEN_STATUS_ID" \
-        --arg notes "Reopened automatically because active DefectDojo finding ${marker} is present again." \
-        '{issue: {status_id: $status_id, notes: $notes}}' \
-        > "$tmpdir/reopen-issue.json"
+    if [[ -n "$found" ]]; then
+        IFS=$'\t' read -r existing_id existing_status_id <<< "$found"
+        break
+    fi
 
-    echo "Reopening Redmine issue #${issue_id} for ${marker}..."
+    fetched="$(jq '.issues | length' "$tmpdir/issues.json")"
+    (( fetched > 0 )) || break
+    offset=$((offset + fetched))
+    (( offset < rm_total )) || break
+done
 
-    if ! code="$(
+# ---------------------------------------------------------------------------
+# 5. Create (first time) or update (every later run) the single ticket.
+# ---------------------------------------------------------------------------
+if [[ -n "$existing_id" ]]; then
+    echo "Updating consolidated Redmine ticket #${existing_id} for: ${job}"
+
+    reopen=0
+    if [[ "$REDMINE_REOPEN_CLOSED" == "true" ]]; then
+        for cid in "${closed_ids[@]}"; do
+            if [[ "$existing_status_id" == "$cid" ]]; then
+                reopen=1
+                break
+            fi
+        done
+    fi
+
+    if [[ "$reopen" == "1" ]]; then
+        echo "Ticket #${existing_id} was closed; reopening and updating."
+        jq -n \
+            --argjson status_id "$REDMINE_REOPEN_STATUS_ID" \
+            --arg subject "$subject" \
+            --arg description "$report" \
+            --arg notes "$note" \
+            '{issue: {status_id: $status_id, subject: $subject, description: $description, notes: $notes}}' \
+            > "$tmpdir/update.json"
+    else
+        jq -n \
+            --arg subject "$subject" \
+            --arg description "$report" \
+            --arg notes "$note" \
+            '{issue: {subject: $subject, description: $description, notes: $notes}}' \
+            > "$tmpdir/update.json"
+    fi
+
+    if ! rcode="$(
         curl --silent --show-error \
             --connect-timeout 15 --max-time 60 \
             --request PUT \
             --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
             --header "Content-Type: application/json" \
             --header "Accept: application/json" \
-            --data @"$tmpdir/reopen-issue.json" \
-            --output "$tmpdir/reopen-response.json" \
+            --data @"$tmpdir/update.json" \
+            --output "$tmpdir/update-response.json" \
             --write-out '%{http_code}' \
-            "${REDMINE_URL}/issues/${issue_id}.json"
+            "${REDMINE_URL}/issues/${existing_id}.json"
     )"; then
-        echo "ERROR: Could not reopen Redmine issue #${issue_id}." >&2
-        return 1
+        echo "ERROR: Redmine update request failed." >&2
+        exit 1
     fi
 
-    if [[ "$code" != "200" && "$code" != "204" ]]; then
-        echo "ERROR: Reopening issue #${issue_id} failed (HTTP ${code})." >&2
-        cat "$tmpdir/reopen-response.json" >&2
-        return 1
-    fi
-
-    echo "Reopened Redmine issue #${issue_id}."
-}
-
-created=0
-reused=0
-reopened=0
-failed=0
-
-while IFS= read -r finding || [[ -n "$finding" ]]; do
-    [[ -n "$finding" ]] || continue
-
-    finding_id="$(jq -r '.id // empty' <<<"$finding")"
-
-    if [[ ! "$finding_id" =~ ^[1-9][0-9]*$ ]]; then
-        echo "WARNING: Skipping finding with invalid ID." >&2
-        continue
-    fi
-
-    title="$(jq -r '.title // .name // "Security finding"' <<<"$finding")"
-    severity="$(jq -r '.severity // "Unknown"' <<<"$finding")"
-    description="$(jq -r '.description // "No description provided."' <<<"$finding")"
-    mitigation="$(jq -r '.mitigation // "No remediation guidance supplied."' <<<"$finding")"
-    impact="$(jq -r '.impact // "Impact not specified."' <<<"$finding")"
-    file_path="$(jq -r '.file_path // .component_name // "Not specified"' <<<"$finding")"
-    line_number="$(jq -r '.line // "Not specified"' <<<"$finding")"
-    component_version="$(jq -r '.component_version // "Not specified"' <<<"$finding")"
-
-    cwe="$(jq -r '
-        if .cwe == null or .cwe == "" then
-            "Not specified"
-        else
-            (.cwe | tostring)
-        end
-    ' <<<"$finding")"
-
-    cve_list="$(jq -r '
-        (.vulnerability_ids // [])
-        | if type == "array" then
-            map(
-                if type == "object" then
-                    (.vulnerability_id // .name // .value // empty)
-                else
-                    tostring
-                end
-            )
-            | map(select(length > 0))
-            | unique
-            | join(", ")
-          else
-            tostring
-          end
-    ' <<<"$finding")"
-
-    [[ -n "$cve_list" ]] || cve_list="Not specified"
-
-    scanner="$(jq -r '
-        (.found_by // [])
-        | if type == "array" then
-            map(
-                if type == "object" then
-                    (.name // .display_name // .id // tostring)
-                else
-                    tostring
-                end
-            ) | join(", ")
-          else
-            tostring
-          end
-    ' <<<"$finding")"
-
-    [[ -n "$scanner" && "$scanner" != "null" ]] || scanner="Not specified"
-
-    finding_url="${DEFECTDOJO_URL}/finding/${finding_id}"
-
-    marker="DD-${finding_id}:"
-
-    # Keep the stable marker at the beginning so lookup finds the ticket.
-    subject="${marker} [${severity^^}] ${title}"
-
-    issue_description="$(
-        printf '%s\n' \
-            "SECURITY FINDING" \
-            "================" \
-            "" \
-            "DefectDojo Finding ID: ${finding_id}" \
-            "Severity: ${severity}" \
-            "Scanner: ${scanner}" \
-            "Affected file/component: ${file_path}" \
-            "Line: ${line_number}" \
-            "Component version: ${component_version}" \
-            "CWE: ${cwe}" \
-            "CVE / vulnerability IDs: ${cve_list}" \
-            "" \
-            "DESCRIPTION" \
-            "-----------" \
-            "$description" \
-            "" \
-            "IMPACT" \
-            "------" \
-            "$impact" \
-            "" \
-            "RECOMMENDED REMEDIATION" \
-            "-----------------------" \
-            "$mitigation" \
-            "" \
-            "DEFECTDOJO FINDING" \
-            "------------------" \
-            "$finding_url"
-    )"
-
-    existing_record=""
-
-    if existing_record="$(find_existing_issue "$marker")"; then
-        IFS=$'\t' read -r existing_id existing_status_id <<< "$existing_record"
-
-        if [[ ! "$existing_id" =~ ^[1-9][0-9]*$ ||
-              ! "$existing_status_id" =~ ^[1-9][0-9]*$ ]]; then
-            echo "ERROR: Existing Redmine issue response has invalid IDs." >&2
-            exit 1
-        fi
-
-        echo "Reusing Redmine issue #${existing_id} for finding ${finding_id}."
-
-        was_closed=false
-        if [[ "$REDMINE_REOPEN_CLOSED" == "true" ]]; then
-            for closed_id in "${closed_ids[@]}"; do
-                if [[ "$existing_status_id" == "$closed_id" ]]; then
-                    was_closed=true
-                    break
-                fi
-            done
-        fi
-
-        if ! reopen_issue_if_configured \
-            "$existing_id" "$existing_status_id" "$marker"; then
-            failed=$((failed + 1))
-            exit 1
-        fi
-
-        if [[ "$was_closed" == "true" ]]; then
-            reopened=$((reopened + 1))
-        fi
-
-        reused=$((reused + 1))
-        continue
+    if [[ "$rcode" == "200" || "$rcode" == "204" ]]; then
+        echo "Consolidated Redmine ticket updated: #${existing_id} (${report_total} active findings)."
     else
-        lookup_status=$?
-        if (( lookup_status == 2 )); then
-            echo "ERROR: Could not safely check for an existing Redmine issue." >&2
-            exit 1
-        fi
+        echo "ERROR: Redmine update failed (HTTP ${rcode})." >&2
+        cat "$tmpdir/update-response.json" >&2
+        exit 1
     fi
+else
+    echo "No existing consolidated ticket for: ${job}; creating one."
 
-    # Use the detailed description above; do not overwrite it here.
     jq -n \
         --argjson project_id "$REDMINE_PROJECT_ID" \
         --argjson tracker_id "$REDMINE_TRACKER_ID" \
         --argjson status_id "$REDMINE_STATUS_ID" \
         --argjson priority_id "$REDMINE_PRIORITY_ID" \
         --arg subject "$subject" \
-        --arg description "$issue_description" \
-        '{
-            issue: {
-                project_id: $project_id,
-                tracker_id: $tracker_id,
-                status_id: $status_id,
-                priority_id: $priority_id,
-                subject: $subject,
-                description: $description
-            }
-        }' > "$tmpdir/new-issue.json"
+        --arg description "$report" \
+        '{issue: {
+            project_id: $project_id,
+            tracker_id: $tracker_id,
+            status_id: $status_id,
+            priority_id: $priority_id,
+            subject: $subject,
+            description: $description
+        }}' > "$tmpdir/create.json"
 
-    jq -e '
-        .issue as $i |
-        ($i.project_id | numbers) and
-        ($i.tracker_id | numbers) and
-        ($i.status_id | numbers) and
-        ($i.priority_id | numbers) and
-        ($i.subject | strings | length > 0)
-    ' "$tmpdir/new-issue.json" >/dev/null || {
-        echo "ERROR: Invalid generated Redmine payload." >&2
-        exit 1
-    }
-
-    echo "Creating Redmine issue for finding ${finding_id}..."
-
-    if ! code="$(
+    if ! rcode="$(
         curl --silent --show-error \
             --connect-timeout 15 --max-time 60 \
             --request POST \
             --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
             --header "Content-Type: application/json" \
             --header "Accept: application/json" \
-            --data @"$tmpdir/new-issue.json" \
+            --data @"$tmpdir/create.json" \
             --output "$tmpdir/create-response.json" \
             --write-out '%{http_code}' \
             "${REDMINE_URL}/issues.json"
@@ -449,18 +456,14 @@ while IFS= read -r finding || [[ -n "$finding" ]]; do
         exit 1
     fi
 
-    if [[ "$code" == "201" ]] &&
+    if [[ "$rcode" == "201" ]] &&
        jq -e '.issue.id | numbers' "$tmpdir/create-response.json" >/dev/null 2>&1; then
-        issue_number="$(jq -r '.issue.id' "$tmpdir/create-response.json")"
-        echo "Created Redmine issue #${issue_number} for finding ${finding_id}."
-        created=$((created + 1))
+        issue_id="$(jq -r '.issue.id' "$tmpdir/create-response.json")"
+        echo "Consolidated Redmine ticket created: #${issue_id} (${report_total} active findings)."
     else
-        echo "ERROR: Redmine issue creation failed (HTTP ${code})." >&2
+        echo "ERROR: Redmine issue creation failed (HTTP ${rcode})." >&2
         jq . "$tmpdir/create-response.json" >&2 2>/dev/null ||
             cat "$tmpdir/create-response.json" >&2
-        failed=$((failed + 1))
         exit 1
     fi
-done < "$tmpdir/findings.ndjson"
-
-echo "Redmine sync complete: created=${created}, reused=${reused}, reopened=${reopened}, failed=${failed}."
+fi

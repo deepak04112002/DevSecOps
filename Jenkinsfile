@@ -1,3 +1,10 @@
+// ---------------------------------------------------------------------------
+// notifyRedmineFailure — creates or updates a single Redmine ticket per
+// failing stage/job. Used only for non-scanner stages (Validate Config,
+// Checkout, Build, Redmine Sync) where the consolidated findings ticket
+// won't exist. Scanner stage failures are captured in the consolidated
+// DefectDojo → Redmine findings ticket produced by Redmine Sync.
+// ---------------------------------------------------------------------------
 def notifyRedmineFailure(String stageName, String details = '') {
     withCredentials([
         string(credentialsId: 'redmine-api-key', variable: 'REDMINE_API_KEY')
@@ -39,43 +46,145 @@ def notifyRedmineFailure(String stageName, String details = '') {
                     tmpdir="$(mktemp -d)"
                     trap 'rm -rf "$tmpdir"' EXIT
 
+                    stage="${REDMINE_FAILURE_STAGE:-Unknown}"
+                    details="${REDMINE_FAILURE_DETAILS:-No additional details were supplied.}"
+                    job="${JOB_NAME:-Unknown}"
+                    build="${BUILD_NUMBER:-Unknown}"
+                    commit="${REDMINE_FAILURE_COMMIT:-Unknown}"
+                    url="${BUILD_URL:-Unavailable}"
+
+                    # Stable marker (no build number) — lets us find and
+                    # update the existing ticket instead of creating a new one
+                    # on every failed build.
+                    marker="[PIPELINE FAILURE] ${stage} - ${job}"
+                    subject="${marker} #${build}"
+
+                    existing_id=""
+                    offset=0
+                    page_size=100
+
+                    while :; do
+                        if ! code="$(
+                            curl --silent --show-error \
+                                --connect-timeout 5 --max-time 15 \
+                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                                --header "Accept: application/json" \
+                                --get \
+                                --data-urlencode "project_id=${REDMINE_PROJECT_ID}" \
+                                --data-urlencode "status_id=*" \
+                                --data-urlencode "limit=${page_size}" \
+                                --data-urlencode "offset=${offset}" \
+                                --output "$tmpdir/issues.json" \
+                                --write-out '%{http_code}' \
+                                "${REDMINE_URL%/}/issues.json"
+                        )"; then
+                            echo "WARNING: Redmine lookup failed; will create a new ticket." >&2
+                            break
+                        fi
+
+                        if [ "$code" != "200" ]; then
+                            echo "WARNING: Redmine lookup returned HTTP ${code}; will create a new ticket." >&2
+                            break
+                        fi
+
+                        jq -e '(.issues | type == "array") and (.total_count | type == "number")' \
+                            "$tmpdir/issues.json" >/dev/null 2>&1 || {
+                            echo "WARNING: Invalid Redmine lookup response; will create a new ticket." >&2
+                            break
+                        }
+
+                        total="$(jq -r '.total_count' "$tmpdir/issues.json")"
+                        match="$(jq -r --arg marker "$marker" '
+                            [.issues[] | select((.subject // "") | startswith($marker)) | .id]
+                            | first // empty
+                        ' "$tmpdir/issues.json")"
+
+                        if [ -n "$match" ]; then
+                            existing_id="$match"
+                            break
+                        fi
+
+                        fetched="$(jq '.issues | length' "$tmpdir/issues.json")"
+                        [ "$fetched" -gt 0 ] || break
+                        offset=$((offset + fetched))
+                        [ "$offset" -lt "$total" ] || break
+                    done
+
+                    if [ -n "$existing_id" ]; then
+                        echo "Updating existing Redmine failure ticket #${existing_id} for stage: ${stage}"
+
+                        note="$(printf 'Failure reoccurred in build #%s.\nGit commit: %s\nBuild URL: %s\n\nFAILURE DETAILS\n---------------\n%s' \
+                            "$build" "$commit" "$url" "$details")"
+
+                        jq -n \
+                            --argjson status_id "$REDMINE_STATUS_ID" \
+                            --arg subject "$subject" \
+                            --arg notes "$note" \
+                            '{issue: {status_id: $status_id, subject: $subject, notes: $notes}}' \
+                            > "$tmpdir/update-issue.json"
+
+                        if ! code="$(
+                            curl --silent --show-error \
+                                --connect-timeout 5 --max-time 15 \
+                                --request PUT \
+                                --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                                --header "Content-Type: application/json" \
+                                --header "Accept: application/json" \
+                                --data @"$tmpdir/update-issue.json" \
+                                --output "$tmpdir/update-response.json" \
+                                --write-out '%{http_code}' \
+                                "${REDMINE_URL%/}/issues/${existing_id}.json"
+                        )"; then
+                            echo "WARNING: Redmine update request failed." >&2
+                            exit 1
+                        fi
+
+                        if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+                            echo "Redmine failure ticket updated: #${existing_id}"
+                        else
+                            echo "WARNING: Redmine update failed (HTTP ${code})." >&2
+                            jq . "$tmpdir/update-response.json" >&2 2>/dev/null ||
+                                cat "$tmpdir/update-response.json" >&2 || true
+                            exit 1
+                        fi
+                        exit 0
+                    fi
+
                     jq -n \
                         --argjson project_id "$REDMINE_PROJECT_ID" \
                         --argjson tracker_id "$REDMINE_TRACKER_ID" \
                         --argjson status_id "$REDMINE_STATUS_ID" \
                         --argjson priority_id "$REDMINE_PRIORITY_ID" \
-                        --arg stage "${REDMINE_FAILURE_STAGE:-Unknown}" \
-                        --arg details "${REDMINE_FAILURE_DETAILS:-No additional details were supplied.}" \
-                        --arg job "${JOB_NAME:-Unknown}" \
-                        --arg build "${BUILD_NUMBER:-Unknown}" \
-                        --arg url "${BUILD_URL:-Unavailable}" \
-                        --arg commit "${REDMINE_FAILURE_COMMIT:-Unknown}" \
+                        --arg subject "$subject" \
+                        --arg stage "$stage" \
+                        --arg details "$details" \
+                        --arg job "$job" \
+                        --arg build "$build" \
+                        --arg url "$url" \
+                        --arg commit "$commit" \
                         '{
                             issue: {
                                 project_id: $project_id,
                                 tracker_id: $tracker_id,
                                 status_id: $status_id,
                                 priority_id: $priority_id,
-                                subject: (
-                                    "[PIPELINE FAILURE] " + $stage +
-                                    " - " + $job + " #" + $build
-                                ),
+                                subject: $subject,
                                 description: (
-                                    "PIPELINE FAILURE REPORT\\n" +
-                                    "=======================\\n\\n" +
-                                    "Failed stage: " + $stage + "\\n" +
-                                    "Job: " + $job + "\\n" +
-                                    "Build: #" + $build + "\\n" +
-                                    "Git commit: " + $commit + "\\n" +
-                                    "Build URL: " + $url + "\\n\\n" +
-                                    "FAILURE DETAILS\\n" +
-                                    "---------------\\n" + $details + "\\n\\n" +
-                                    "INVESTIGATION CHECKLIST\\n" +
-                                    "-----------------------\\n" +
-                                    "1. Open the Jenkins build URL.\\n" +
-                                    "2. Inspect the failed stage and console output.\\n" +
-                                    "3. Review the relevant scanner report or API response.\\n" +
-                                    "4. Correct the root cause and rerun the pipeline.\\n"
+                                    "PIPELINE FAILURE REPORT\n" +
+                                    "=======================\n\n" +
+                                    "Failed stage: " + $stage + "\n" +
+                                    "Job: " + $job + "\n" +
+                                    "Build: #" + $build + "\n" +
+                                    "Git commit: " + $commit + "\n" +
+                                    "Build URL: " + $url + "\n\n" +
+                                    "FAILURE DETAILS\n" +
+                                    "---------------\n" + $details + "\n\n" +
+                                    "INVESTIGATION CHECKLIST\n" +
+                                    "-----------------------\n" +
+                                    "1. Open the Jenkins build URL.\n" +
+                                    "2. Inspect the failed stage and console output.\n" +
+                                    "3. Review the relevant scanner report or API response.\n" +
+                                    "4. Correct the root cause and rerun the pipeline.\n"
                                 )
                             }
                         }' > "$tmpdir/issue.json"
@@ -110,12 +219,15 @@ def notifyRedmineFailure(String stageName, String details = '') {
             )
 
             if (notifyStatus != 0) {
-                echo "WARNING: Could not create the Redmine failure ticket for stage: ${stageName}"
+                echo "WARNING: Could not create Redmine failure ticket for stage: ${stageName}"
             }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------------
 pipeline {
     agent any
 
@@ -164,12 +276,12 @@ pipeline {
         booleanParam(
             name: 'REOPEN_CLOSED_REDMINE_TICKETS',
             defaultValue: false,
-            description: 'Reopen matching closed Redmine tickets when findings are active again'
+            description: 'Reopen the consolidated Redmine ticket if it was closed and findings are active again'
         )
         string(
             name: 'REDMINE_REOPEN_STATUS_ID',
             defaultValue: '',
-            description: 'Redmine status ID to use when reopening tickets; required if reopening is enabled'
+            description: 'Redmine status ID to use when reopening; required if reopening is enabled'
         )
         string(
             name: 'REDMINE_CLOSED_STATUS_IDS',
@@ -179,31 +291,35 @@ pipeline {
     }
 
     environment {
-        SONAR_HOST_URL = 'http://sonarqube:9000'
-        SONAR_PROJECT_KEY = "${params.SONAR_PROJECT_KEY}"
+        SONAR_HOST_URL        = 'http://sonarqube:9000'
+        SONAR_PROJECT_KEY     = "${params.SONAR_PROJECT_KEY}"
 
-        DEFECTDOJO_URL = 'http://defectdojo-nginx:8080'
-        DEFECTDOJO_PRODUCT_ID='1'
-        DEFECTDOJO_ENGAGEMENT_ID = '1'
-        DEFECTDOJO_PRODUCT_NAME = 'DevSecOps Pipeline'
+        DEFECTDOJO_URL            = 'http://defectdojo-nginx:8080'
+        DEFECTDOJO_PRODUCT_ID     = '1'
+        DEFECTDOJO_ENGAGEMENT_ID  = '1'
+        DEFECTDOJO_PRODUCT_NAME   = 'DevSecOps Pipeline'
         DEFECTDOJO_ENGAGEMENT_NAME = 'CI Pipeline'
         DEFECTDOJO_POLL_INTERVAL_SECONDS = '5'
-        DEFECTDOJO_POLL_TIMEOUT_SECONDS = '1800'
+        DEFECTDOJO_POLL_TIMEOUT_SECONDS  = '1800'
 
-        REDMINE_URL = 'http://redmine:3000'
+        REDMINE_URL        = 'http://redmine:3000'
         REDMINE_PROJECT_ID = '1'
         REDMINE_TRACKER_ID = '1'
-        REDMINE_STATUS_ID = '1'
+        REDMINE_STATUS_ID  = '1'
         REDMINE_PRIORITY_ID = '2'
 
-        REDMINE_REOPEN_CLOSED = "${params.REOPEN_CLOSED_REDMINE_TICKETS}"
-        REDMINE_REOPEN_STATUS_ID = "${params.REDMINE_REOPEN_STATUS_ID}"
-        REDMINE_CLOSED_STATUS_IDS = "${params.REDMINE_CLOSED_STATUS_IDS}"
+        REDMINE_REOPEN_CLOSED      = "${params.REOPEN_CLOSED_REDMINE_TICKETS}"
+        REDMINE_REOPEN_STATUS_ID   = "${params.REDMINE_REOPEN_STATUS_ID}"
+        REDMINE_CLOSED_STATUS_IDS  = "${params.REDMINE_CLOSED_STATUS_IDS}"
 
         PYTHONUNBUFFERED = '1'
     }
 
     stages {
+
+        // -------------------------------------------------------------------
+        // 1. Validate Configuration
+        // -------------------------------------------------------------------
         stage('Validate Configuration') {
             steps {
                 sh '''
@@ -213,16 +329,6 @@ pipeline {
                     : "${DEFECTDOJO_PRODUCT_NAME:?Set DEFECTDOJO_PRODUCT_NAME}"
                     : "${DEFECTDOJO_ENGAGEMENT_NAME:?Set DEFECTDOJO_ENGAGEMENT_NAME}"
                     : "${REDMINE_URL:?Set REDMINE_URL}"
-
-                    [ -n "$DEFECTDOJO_PRODUCT_NAME" ] || {
-                        echo "ERROR: DefectDojo product name is empty." >&2
-                        exit 1
-                    }
-
-                    [ -n "$DEFECTDOJO_ENGAGEMENT_NAME" ] || {
-                        echo "ERROR: DefectDojo engagement name is empty." >&2
-                        exit 1
-                    }
 
                     for name in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
                                 REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
@@ -249,7 +355,7 @@ pipeline {
                         IFS=','
                         for id in $REDMINE_CLOSED_STATUS_IDS; do
                             if ! printf '%s' "$id" | grep -Eq '^[1-9][0-9]*$'; then
-                                echo "ERROR: Closed status IDs must be comma-separated positive integers without spaces." >&2
+                                echo "ERROR: REDMINE_CLOSED_STATUS_IDS must be comma-separated positive integers." >&2
                                 exit 1
                             fi
                         done
@@ -272,6 +378,9 @@ pipeline {
             }
         }
 
+        // -------------------------------------------------------------------
+        // 2. Checkout
+        // -------------------------------------------------------------------
         stage('Checkout') {
             steps {
                 cleanWs()
@@ -301,13 +410,15 @@ pipeline {
             }
         }
 
+        // -------------------------------------------------------------------
+        // 3. Build and Unit Tests
+        // -------------------------------------------------------------------
         stage('Build and Unit Tests') {
             steps {
                 sh '''
                     set -eu
 
-                    if [ -f Makefile ] &&
-                       grep -qE '^[[:space:]]*test:' Makefile; then
+                    if [ -f Makefile ] && grep -qE '^[[:space:]]*test:' Makefile; then
                         make test
                     elif [ -f pom.xml ]; then
                         mvn -B test package
@@ -315,8 +426,8 @@ pipeline {
                         npm ci
                         npm test
                     else
-                        echo "No supported build detected."
-                        echo "Add the application's build and test commands."
+                        echo "No supported build file detected (Makefile / pom.xml / package.json)."
+                        echo "Add the application build and test commands."
                         exit 2
                     fi
                 '''
@@ -334,315 +445,113 @@ pipeline {
             }
         }
 
+        // -------------------------------------------------------------------
+        // 4. SonarQube SAST
+        //
+        // Two independent catchError blocks so the two failure modes are
+        // distinguished clearly:
+        //
+        //   Block A – sonar-scanner / quality gate
+        //     Quality gate fail  → build UNSTABLE  (code-quality warning,
+        //                          does NOT block downstream stages)
+        //     Scanner crash      → build UNSTABLE  (same treatment; the
+        //                          DefectDojo import may still succeed with
+        //                          whatever issues were already uploaded)
+        //
+        //   Block B – SonarQube API export + DefectDojo import
+        //     Import fail        → build FAILURE   (real infra problem;
+        //                          findings didn't reach DefectDojo)
+        //     Always runs even when Block A marks the stage failed.
+        // -------------------------------------------------------------------
         stage('SonarQube SAST') {
             steps {
-                catchError(
-                    buildResult: 'UNSTABLE',
-                    stageResult: 'FAILURE'
-                ) {
+                // Block A: run the scanner; quality-gate failure → UNSTABLE
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
                     withCredentials([
-                        string(
-                            credentialsId: 'sonarqube-token',
-                            variable: 'SONAR_TOKEN'
-                        )
+                        string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
                     ]) {
                         sh '''
                             set -eu
 
                             sonar-scanner \
-                              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
-                              -Dsonar.projectName="$SONAR_PROJECT_KEY" \
-                              -Dsonar.sources=. \
-                              -Dsonar.host.url="$SONAR_HOST_URL" \
-                              -Dsonar.token="$SONAR_TOKEN" \
-                              -Dsonar.qualitygate.wait=true
+                                -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                                -Dsonar.projectName="$SONAR_PROJECT_KEY" \
+                                -Dsonar.sources=. \
+                                -Dsonar.host.url="$SONAR_HOST_URL" \
+                                -Dsonar.token="$SONAR_TOKEN" \
+                                -Dsonar.qualitygate.wait=true
                         '''
                     }
                 }
-            }
 
-            post {
-                failure {
-                    script {
-                        notifyRedmineFailure(
-                            'SonarQube SAST',
-                            'SonarScanner failed or the SonarQube Quality Gate did not pass. Review the scanner output and the SonarQube project dashboard to determine which occurred.'
-                        )
+                // Block B: export issues from SonarQube API and import to
+                // DefectDojo. Runs regardless of Block A outcome.
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'sonarqube-token',    variable: 'SONAR_TOKEN'),
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            mkdir -p artifacts/sonar
+
+                            # ---- Paginate the SonarQube issues API ----
+                            page=1
+                            total_pages=1
+                            all_issues="[]"
+
+                            while [ "$page" -le "$total_pages" ]; do
+                                response="$(
+                                    curl --fail --silent --show-error \
+                                        --connect-timeout 10 --max-time 60 \
+                                        --header "Authorization: Bearer ${SONAR_TOKEN}" \
+                                        --get \
+                                        --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
+                                        --data-urlencode "resolved=false" \
+                                        --data-urlencode "ps=500" \
+                                        --data-urlencode "p=${page}" \
+                                        --data-urlencode "additionalFields=_all" \
+                                        "${SONAR_HOST_URL}/api/issues/search"
+                                )"
+
+                                echo "$response" | \
+                                    jq -e '(.issues | type == "array") and (.total | type == "number")' \
+                                    >/dev/null
+
+                                total="$(echo "$response" | jq -r '.total')"
+                                total_pages=$(( (total + 499) / 500 ))
+
+                                issues="$(echo "$response" | jq '.issues')"
+                                all_issues="$(
+                                    jq -n \
+                                        --argjson a "$all_issues" \
+                                        --argjson b "$issues" \
+                                        '$a + $b'
+                                )"
+
+                                page=$((page + 1))
+                            done
+
+                            jq -n \
+                                --argjson issues "$all_issues" \
+                                '{
+                                    issues: $issues,
+                                    total:  ($issues | length),
+                                    p:  1,
+                                    ps: ($issues | length)
+                                }' > artifacts/sonar/sonar-report.json
+
+                            test -s artifacts/sonar/sonar-report.json
+
+                            # ---- Import into DefectDojo ----
+                            export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
+                            export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
+                            export DEFECTDOJO_TEST_TITLE="SonarQube SAST"
+
+                            bash /opt/devsecops/scripts/defectdojo_import.sh
+                        '''
                     }
-                }
-            }
-        }
-
-        stage('Trivy SCA') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-
-                        mkdir -p artifacts/trivy
-
-                        trivy fs \
-                            --exit-code 0 \
-                            --format json \
-                            --output artifacts/trivy/trivy-report.json \
-                            --scanners vuln,secret \
-                            --skip-dirs .git,node_modules,artifacts \
-                            .
-
-                        export DEFECTDOJO_SCAN_FILE="artifacts/trivy/trivy-report.json"
-                        export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
-                        export DEFECTDOJO_TEST_TITLE="Trivy SCA"
-
-                        bash /opt/devsecops/scripts/defectdojo_import.sh
-                    '''
-                }
-            }
-
-            post {
-                always {
-                    archiveArtifacts(
-                        artifacts: 'artifacts/trivy/**',
-                        allowEmptyArchive: true
-                    )
-                }
-
-                failure {
-                    script {
-                        notifyRedmineFailure(
-                            'Trivy SCA',
-                            'Trivy scanning or the DefectDojo import failed. Inspect artifacts/trivy/trivy-report.json and the Jenkins console for the scanner or API error.'
-                        )
-                    }
-                }
-            }
-        }
-
-        stage('Joern CPG Analysis') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-
-                        mkdir -p artifacts/joern
-                        command -v joern-parse >/dev/null
-
-                        find . -type d \\( \
-                            -name node_modules -o \
-                            -name .git -o \
-                            -name target -o \
-                            -name build -o \
-                            -name dist -o \
-                            -name artifacts \
-                        \\) -prune -o -type f -print \
-                            > artifacts/joern/source-files.txt
-
-                        run_parser() {
-                            language="$1"
-                            pattern="$2"
-                            output="artifacts/joern/${language}-cpg.bin"
-                            filelist="artifacts/joern/${language}-files.txt"
-
-                            grep -Ei "$pattern" artifacts/joern/source-files.txt \
-                                > "$filelist" || true
-
-                            if [ ! -s "$filelist" ]; then
-                                echo "Skipping $language: no matching files."
-                                return 0
-                            fi
-
-                            input_dir="artifacts/joern/input-${language}"
-                            mkdir -p "$input_dir"
-
-                            while IFS= read -r file; do
-                                [ -f "$file" ] || continue
-                                relative="${file#./}"
-                                mkdir -p "$input_dir/$(dirname "$relative")"
-                                cp "$file" "$input_dir/$relative"
-                            done < "$filelist"
-
-                            if find "$input_dir" -type f -print -quit | grep -q .; then
-                                joern-parse \
-                                    --language "$language" \
-                                    --output "$output" \
-                                    "$input_dir"
-                                test -s "$output"
-                            fi
-                        }
-
-                        run_parser javascript '\\.(js|jsx|mjs|cjs)$'
-                        run_parser python '\\.py$'
-                        run_parser java '\\.java$'
-                        run_parser kotlin '\\.kt$'
-                        run_parser golang '\\.go$'
-                        run_parser csharp '\\.cs$'
-                        run_parser php '\\.php$'
-                        run_parser rubysrc '\\.rb$'
-                        run_parser c '\\.c$'
-                        run_parser newc '\\.(cc|cpp|cxx|h|hpp|hh|hxx)$'
-                        run_parser rust '\\.rs$'
-                        run_parser swift '\\.swift$'
-                        run_parser abap '\\.abap$'
-
-                        export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
-
-                        # joern_import.sh must generate a supported report and
-                        # export DEFECTDOJO_SCAN_FILE and DEFECTDOJO_SCAN_TYPE.
-                        /opt/devsecops/scripts/joern_import.sh
-                    '''
-                }
-            }
-
-            post {
-                always {
-                    archiveArtifacts(
-                        artifacts: 'artifacts/joern/**',
-                        allowEmptyArchive: true
-                    )
-                }
-
-                failure {
-                    script {
-                        notifyRedmineFailure(
-                            'Joern CPG Analysis',
-                            'Joern parsing, report generation, or DefectDojo import failed. Review artifacts/joern/ and the Jenkins console.'
-                        )
-                    }
-                }
-            }
-        }
-
-        stage('Qualys Export') {
-            when {
-                expression { params.RUN_QUALYS }
-            }
-
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'qualys-credentials',
-                        usernameVariable: 'QUALYS_USERNAME',
-                        passwordVariable: 'QUALYS_PASSWORD'
-                    ),
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-
-                        mkdir -p artifacts/qualys
-                        export QUALYS_REPORT_ID="${QUALYS_REPORT_ID:-}"
-
-                        /opt/devsecops/scripts/qualys_export.sh
-
-                        export DEFECTDOJO_SCAN_FILE="artifacts/qualys/qualys-report.xml"
-                        export DEFECTDOJO_SCAN_TYPE="Qualys Scan"
-                        export DEFECTDOJO_TEST_TITLE="Qualys Vulnerability Scan"
-
-                        bash /opt/devsecops/scripts/defectdojo_import.sh
-                    '''
-                }
-            }
-
-            post {
-                always {
-                    archiveArtifacts(
-                        artifacts: 'artifacts/qualys/**',
-                        allowEmptyArchive: true
-                    )
-                }
-
-                failure {
-                    script {
-                        notifyRedmineFailure(
-                            'Qualys Export',
-                            'Qualys report export or DefectDojo import failed. Verify the report ID, Qualys credentials, report file, and API response.'
-                        )
-                    }
-                }
-            }
-        }
-
-        stage('DefectDojo Import - SonarQube') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    ),
-                    string(
-                        credentialsId: 'sonarqube-token',
-                        variable: 'SONAR_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-
-                        mkdir -p artifacts/sonar
-                        page=1
-                        total_pages=1
-                        all_issues="[]"
-
-                        while [ "$page" -le "$total_pages" ]; do
-                            response="$(
-                                curl --fail --silent --show-error \
-                                    --connect-timeout 10 --max-time 60 \
-                                    --header "Authorization: Bearer ${SONAR_TOKEN}" \
-                                    --get \
-                                    --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
-                                    --data-urlencode "resolved=false" \
-                                    --data-urlencode "ps=500" \
-                                    --data-urlencode "p=${page}" \
-                                    --data-urlencode "additionalFields=_all" \
-                                    "${SONAR_HOST_URL}/api/issues/search"
-                            )"
-
-                            echo "$response" |
-                                jq -e '(.issues | type == "array") and (.total | type == "number")' \
-                                >/dev/null
-
-                            total="$(echo "$response" | jq -r '.total')"
-                            total_pages=$(( (total + 499) / 500 ))
-
-                            issues="$(echo "$response" | jq '.issues')"
-                            all_issues="$(
-                                jq -n \
-                                    --argjson a "$all_issues" \
-                                    --argjson b "$issues" \
-                                    '$a + $b'
-                            )"
-
-                            page=$((page + 1))
-                        done
-
-                        jq -n \
-                            --argjson issues "$all_issues" \
-                            '{
-                                issues: $issues,
-                                total: ($issues | length),
-                                p: 1,
-                                ps: ($issues | length)
-                            }' > artifacts/sonar/sonar-report.json
-
-                        test -s artifacts/sonar/sonar-report.json
-
-                        export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
-                        export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
-                        export DEFECTDOJO_TEST_TITLE="SonarQube SAST"
-
-                        bash /opt/devsecops/scripts/defectdojo_import.sh
-                    '''
                 }
             }
 
@@ -653,18 +562,206 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-
-                failure {
-                    script {
-                        notifyRedmineFailure(
-                            'DefectDojo Import - SonarQube',
-                            'The SonarQube issue export or DefectDojo import failed. Inspect the SonarQube API response, artifacts/sonar/sonar-report.json, and DefectDojo API error.'
-                        )
-                    }
-                }
+                // No notifyRedmineFailure here — scanner findings are
+                // captured in the consolidated Redmine Sync ticket.
             }
         }
 
+        // -------------------------------------------------------------------
+        // 5. Trivy SCA — filesystem vulnerability + secret scan → DefectDojo
+        // -------------------------------------------------------------------
+        stage('Trivy SCA') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            mkdir -p artifacts/trivy
+
+                            trivy fs \
+                                --exit-code 0 \
+                                --format json \
+                                --output artifacts/trivy/trivy-report.json \
+                                --scanners vuln,secret \
+                                --skip-dirs .git,node_modules,artifacts \
+                                .
+
+                            export DEFECTDOJO_SCAN_FILE="artifacts/trivy/trivy-report.json"
+                            export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
+                            export DEFECTDOJO_TEST_TITLE="Trivy SCA"
+
+                            bash /opt/devsecops/scripts/defectdojo_import.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/trivy/**',
+                        allowEmptyArchive: true
+                    )
+                }
+                // No notifyRedmineFailure — captured in consolidated ticket.
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 6. Joern CPG Analysis — code property graph SAST → DefectDojo
+        // -------------------------------------------------------------------
+        stage('Joern CPG Analysis') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            mkdir -p artifacts/joern
+                            command -v joern-parse >/dev/null
+
+                            find . -type d \\( \
+                                -name node_modules -o \
+                                -name .git         -o \
+                                -name target       -o \
+                                -name build        -o \
+                                -name dist         -o \
+                                -name artifacts    \
+                            \\) -prune -o -type f -print \
+                                > artifacts/joern/source-files.txt
+
+                            run_parser() {
+                                language="$1"
+                                pattern="$2"
+                                output="artifacts/joern/${language}-cpg.bin"
+                                filelist="artifacts/joern/${language}-files.txt"
+
+                                grep -Ei "$pattern" artifacts/joern/source-files.txt \
+                                    > "$filelist" || true
+
+                                if [ ! -s "$filelist" ]; then
+                                    echo "Skipping $language: no matching files."
+                                    return 0
+                                fi
+
+                                input_dir="artifacts/joern/input-${language}"
+                                mkdir -p "$input_dir"
+
+                                while IFS= read -r file; do
+                                    [ -f "$file" ] || continue
+                                    relative="${file#./}"
+                                    mkdir -p "$input_dir/$(dirname "$relative")"
+                                    cp "$file" "$input_dir/$relative"
+                                done < "$filelist"
+
+                                if find "$input_dir" -type f -print -quit | grep -q .; then
+                                    joern-parse \
+                                        --language "$language" \
+                                        --output   "$output" \
+                                        "$input_dir"
+                                    test -s "$output"
+                                fi
+                            }
+
+                            run_parser javascript  '\\.(js|jsx|mjs|cjs)$'
+                            run_parser python      '\\.py$'
+                            run_parser java        '\\.java$'
+                            run_parser kotlin      '\\.kt$'
+                            run_parser golang      '\\.go$'
+                            run_parser csharp      '\\.cs$'
+                            run_parser php         '\\.php$'
+                            run_parser rubysrc     '\\.rb$'
+                            run_parser c           '\\.c$'
+                            run_parser newc        '\\.(cc|cpp|cxx|h|hpp|hh|hxx)$'
+                            run_parser rust        '\\.rs$'
+                            run_parser swift       '\\.swift$'
+                            run_parser abap        '\\.abap$'
+
+                            export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
+
+                            # joern_import.sh must produce a supported report
+                            # and export DEFECTDOJO_SCAN_FILE + DEFECTDOJO_SCAN_TYPE.
+                            /opt/devsecops/scripts/joern_import.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/joern/**',
+                        allowEmptyArchive: true
+                    )
+                }
+                // No notifyRedmineFailure — captured in consolidated ticket.
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 7. Qualys Export (optional) — VM scan report → DefectDojo
+        // -------------------------------------------------------------------
+        stage('Qualys Export') {
+            when {
+                expression { params.RUN_QUALYS }
+            }
+
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'qualys-credentials',
+                            usernameVariable: 'QUALYS_USERNAME',
+                            passwordVariable: 'QUALYS_PASSWORD'
+                        ),
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            mkdir -p artifacts/qualys
+                            export QUALYS_REPORT_ID="${QUALYS_REPORT_ID:-}"
+
+                            /opt/devsecops/scripts/qualys_export.sh
+
+                            export DEFECTDOJO_SCAN_FILE="artifacts/qualys/qualys-report.xml"
+                            export DEFECTDOJO_SCAN_TYPE="Qualys Scan"
+                            export DEFECTDOJO_TEST_TITLE="Qualys Vulnerability Scan"
+
+                            bash /opt/devsecops/scripts/defectdojo_import.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/qualys/**',
+                        allowEmptyArchive: true
+                    )
+                }
+                // No notifyRedmineFailure — captured in consolidated ticket.
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 8. Redmine Sync
+        //
+        // Pulls every active finding from DefectDojo (all scanners combined),
+        // builds a consolidated report grouped by scanner and severity, then
+        // creates or updates a single Redmine ticket for this job.
+        //
+        // First run  → ticket created.
+        // Later runs → same ticket updated: description replaced with the
+        //              latest full report; a short per-build summary appended
+        //              as a note (running history).
+        // -------------------------------------------------------------------
         stage('Redmine Sync') {
             when {
                 expression { params.SYNC_REDMINE }
@@ -672,14 +769,8 @@ pipeline {
 
             steps {
                 withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    ),
-                    string(
-                        credentialsId: 'redmine-api-key',
-                        variable: 'REDMINE_API_KEY'
-                    )
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                    string(credentialsId: 'redmine-api-key',       variable: 'REDMINE_API_KEY')
                 ]) {
                     sh '/opt/devsecops/scripts/redmine_sync.sh'
                 }
@@ -690,7 +781,7 @@ pipeline {
                     script {
                         notifyRedmineFailure(
                             'Redmine Sync',
-                            'The DefectDojo-to-Redmine synchronization failed. Review the Redmine API response, finding data, and redmine_sync.sh console output.'
+                            'The DefectDojo-to-Redmine sync failed. Review the Redmine API response and redmine_sync.sh console output.'
                         )
                     }
                 }
@@ -698,17 +789,20 @@ pipeline {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Global post actions
+    // -----------------------------------------------------------------------
     post {
         success {
             echo "Pipeline completed successfully. Build: #${env.BUILD_NUMBER}"
         }
 
         unstable {
-            echo "Pipeline completed with unstable status. Build: #${env.BUILD_NUMBER}"
+            echo "Pipeline completed UNSTABLE (SonarQube quality gate). Build: #${env.BUILD_NUMBER}"
         }
 
         failure {
-            echo "Pipeline failed. Build: #${env.BUILD_NUMBER}"
+            echo "Pipeline FAILED. Build: #${env.BUILD_NUMBER}"
         }
 
         always {

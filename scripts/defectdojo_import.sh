@@ -122,7 +122,11 @@ if [[ "$test_id" =~ ^[1-9][0-9]*$ ]]; then
 else
     # Legacy tests may have a different title, such as "CI security scan".
     # Reuse the newest test of the same scan type rather than creating
-    # another test unnecessarily.
+    # another test unnecessarily. If the legacy test cannot be safely
+    # reused (missing/invalid id or empty title), fall back to a fresh
+    # import-scan with the requested title instead of aborting -- a
+    # duplicate test is preferable to losing the findings and skipping
+    # the rest of the pipeline (SonarQube import, Redmine sync).
     existing_test="$(
         jq -c \
             --arg scan_type "$DEFECTDOJO_SCAN_TYPE" \
@@ -135,18 +139,21 @@ else
     )"
 
     if [[ -n "$existing_test" ]]; then
-        test_id="$(jq -r '.id' <<< "$existing_test")"
+        test_id="$(jq -r '.id // empty' <<< "$existing_test")"
         existing_title="$(jq -r '.test_title // empty' <<< "$existing_test")"
 
-        if [[ ! "$test_id" =~ ^[1-9][0-9]*$ || -z "$existing_title" ]]; then
-            echo "ERROR: Could not identify the existing compatible test." >&2
-            exit 1
+        if [[ "$test_id" =~ ^[1-9][0-9]*$ && -n "$existing_title" ]]; then
+            echo "No exact title match; reusing existing test ID $test_id."
+            echo "Using existing title: $existing_title"
+            TITLE="$existing_title"
+            endpoint="reimport-scan"
+        else
+            echo "WARNING: Existing test for scan type '$DEFECTDOJO_SCAN_TYPE'" >&2
+            echo "WARNING: has an invalid id ('$test_id') or empty title and" >&2
+            echo "WARNING: cannot be safely reused. Falling back to a fresh" >&2
+            echo "WARNING: import-scan with title '$TITLE'." >&2
+            endpoint="import-scan"
         fi
-
-        echo "No exact title match; reusing existing test ID $test_id."
-        echo "Using existing title: $existing_title"
-        TITLE="$existing_title"
-        endpoint="reimport-scan"
     else
         echo "No existing test for this scan type was found."
         echo "Creating the first test in engagement $DEFECTDOJO_ENGAGEMENT_ID."
