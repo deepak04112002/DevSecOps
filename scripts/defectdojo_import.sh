@@ -182,7 +182,7 @@ if ! http_code="$(
             --form-string "scan_type=${DEFECTDOJO_SCAN_TYPE}" \
             --form-string "product_name=${DEFECTDOJO_PRODUCT_NAME}" \
             --form-string "engagement_name=${DEFECTDOJO_ENGAGEMENT_NAME}" \
-            --form-string "close_old_findings=false" \
+            --form-string "close_old_findings=true" \
             --form-string "minimum_severity=Info" \
             --form-string "deduplication_execution_mode=async_wait" \
             --form-string "test_title=${TITLE}" \
@@ -199,7 +199,7 @@ if ! http_code="$(
             --header "Accept: application/json" \
             --form-string "scan_type=${DEFECTDOJO_SCAN_TYPE}" \
             --form-string "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
-            --form-string "close_old_findings=false" \
+            --form-string "close_old_findings=true" \
             --form-string "minimum_severity=Info" \
             --form-string "deduplication_execution_mode=async_wait" \
             --form-string "test_title=${TITLE}" \
