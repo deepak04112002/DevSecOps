@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Central gitleaks configuration.
+#
+# Used by:
+#   - the Jenkins "Gitleaks Secret Scan" stage (via gitleaks_scan.sh)
+#   - developer pre-commit hooks (copy this file to the repo root as
+#     .gitleaks.toml, which gitleaks picks up automatically)
+#
+# Keep allowlists narrow. Allowlist paths for generated or vendored content
+# only. Never allowlist a real credential to silence a finding; rotate it
+# instead.
+# ---------------------------------------------------------------------------
+
+title = "Central gitleaks configuration"
+
+[extend]
+# Start from gitleaks' built-in rule set (AWS, GCP, GitHub, Slack, private
+# keys, generic API keys, and so on) and layer the rules below on top.
+useDefault = true
+
+# ---- Global allowlist ------------------------------------------------------
+[allowlist]
+description = "Generated, vendored, and non-source paths"
+
+paths = [
+    '''(^|/)\.git/''',
+    '''(^|/)node_modules/''',
+    '''(^|/)vendor/''',
+    '''(^|/)target/''',
+    '''(^|/)dist/''',
+    '''(^|/)build/''',
+    '''(^|/)artifacts/''',
+    '''(^|/)package-lock\.json$''',
+    '''(^|/)yarn\.lock$''',
+    '''(^|/)pnpm-lock\.yaml$''',
+    '''(^|/)go\.sum$''',
+    '''\.lock$''',
+]
+
+# Known-safe placeholder values that appear in docs and examples.
+# Add entries only after review.
+regexes = [
+    '''EXAMPLE_KEY''',
+    '''<your-(api|secret|token)-?key>''',
+    '''(?i)changeme''',
+]
+
+# ---- Custom rules (examples; uncomment and adapt as needed) ----------------
+# [[rules]]
+# id = "internal-service-token"
+# description = "Internal service token"
+# regex = '''svc_[A-Za-z0-9]{32}'''
+# tags = ["key", "internal"]
+#
+# [[rules]]
+# id = "redmine-api-key"
+# description = "Redmine API key assigned in code"
+# regex = '''(?i)redmine[_-]?api[_-]?key\s*[:=]\s*["'][a-f0-9]{40}["']'''
+# tags = ["key", "redmine"]

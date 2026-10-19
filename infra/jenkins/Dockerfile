@@ -50,6 +50,15 @@ RUN curl -fsSL https://github.com/joernio/joern/releases/latest/download/joern-i
     && /tmp/joern-install.sh --install-dir /opt/joern --no-interactive \
     && rm /tmp/joern-install.sh
 
+# Gitleaks — git secret scanning
+ARG GITLEAKS_VERSION=8.30.1
+RUN curl -fsSL \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+    -o /tmp/gitleaks.tar.gz \
+    && tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks \
+    && chmod +x /usr/local/bin/gitleaks \
+    && rm /tmp/gitleaks.tar.gz
+
 ENV PATH="/opt/joern/joern-cli:${PATH}"
 
 COPY casc/ /usr/share/jenkins/ref/casc/

@@ -412,7 +412,45 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 3. Build and Unit Tests
+        // 3. Gitleaks Secret Scan — runs before any build or external scanner
+        //
+        // Scans the checked-out repository (full git history by default) for
+        // committed secrets. The wrapper script produces the JSON report,
+        // imports it into DefectDojo, and the Security Policy Gate fails the
+        // build on any detected secret.
+        // -------------------------------------------------------------------
+        stage('Gitleaks Secret Scan') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            export GITLEAKS_SOURCE="."
+                            export GITLEAKS_REPORT_DIR="artifacts/gitleaks"
+
+                            bash /opt/devsecops/scripts/gitleaks_scan.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/gitleaks/**',
+                        allowEmptyArchive: true
+                    )
+                }
+                // No notifyRedmineFailure — findings are captured in the
+                // consolidated Redmine Sync ticket.
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 4. Build and Unit Tests
         // -------------------------------------------------------------------
         stage('Build and Unit Tests') {
             steps {
@@ -447,7 +485,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 4. SonarQube SAST
+        // 5. SonarQube SAST
         //
         // Two independent catchError blocks so the two failure modes are
         // distinguished clearly:
@@ -563,13 +601,13 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-                // No notifyRedmineFailure here — scanner findings are
+                // No notifyRedmineFailure — scanner findings are
                 // captured in the consolidated Redmine Sync ticket.
             }
         }
 
         // -------------------------------------------------------------------
-        // 5. Trivy SCA — filesystem vulnerability + secret scan → DefectDojo
+        // 6. Trivy SCA — filesystem vulnerability + secret scan → DefectDojo
         // -------------------------------------------------------------------
         stage('Trivy SCA') {
             steps {
@@ -612,7 +650,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 6. Joern CPG Analysis — code property graph SAST → DefectDojo
+        // 7. Joern CPG Analysis — code property graph SAST → DefectDojo
         //
         // Three steps per language:
         //   a. joern-parse  — build the CPG (.bin) from source files
@@ -749,7 +787,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 7. Qualys Export (optional) — VM scan report → DefectDojo
+        // 8. Qualys Export (optional) — VM scan report → DefectDojo
         // -------------------------------------------------------------------
         stage('Qualys Export') {
             when {
@@ -796,7 +834,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 8. Security Report (PDF)
+        // 9. Security Report (PDF)
         //
         // Fetches all active DefectDojo findings, builds a styled HTML report
         // grouped by severity and scanner, then converts it to PDF via
@@ -826,7 +864,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 9. Redmine Sync
+        // 10. Redmine Sync
         //
         // Pulls every active finding from DefectDojo (all scanners combined),
         // builds a consolidated report grouped by scanner and severity, then
@@ -863,15 +901,20 @@ pipeline {
             }
         }
 
-        //10: a central security policy gate to your existing Jenkins pipeline. It will check findings from all scanners in DefectDojo and decide whether the build passes or fails, instead of relying only on Trivy's exit code.
-
-        // Your desired policy will be:
+        // -------------------------------------------------------------------
+        // 11. Security Policy Gate
+        //
+        // Checks findings from all scanners in DefectDojo and decides whether
+        // the build passes or fails, instead of relying only on Trivy's exit
+        // code.
+        //
+        // Policy:
         // - CRITICAL, HIGH, or MEDIUM findings: fail immediately.
-        // - Any detected secret: fail immediately.
+        // - Any detected secret (Gitleaks or Trivy): fail immediately.
         // - New LOW vulnerability: pass and record it.
         // - Previously seen LOW vulnerability found again in a later build: fail.
         // - Scan or DefectDojo import failure: fail.
-        
+        // -------------------------------------------------------------------
         stage('Security Policy Gate') {
             steps {
                 withCredentials([
@@ -885,9 +928,6 @@ pipeline {
             }
         }
     }
-
-
-
 
     // -----------------------------------------------------------------------
     // Global post actions
