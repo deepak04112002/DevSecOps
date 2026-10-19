@@ -466,7 +466,7 @@ pipeline {
         stage('SonarQube SAST') {
             steps {
                 // Block A: run the scanner; quality-gate failure → UNSTABLE
-                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     withCredentials([
                         string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
                     ]) {
