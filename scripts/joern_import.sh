@@ -65,7 +65,6 @@ for i in "${!result_files[@]}"; do
                                 .ruleId //
                                 "Joern Finding"
                             ),
-                            rule_id: (.ruleId // ""),
                             severity: (
                                 if .level == "error" then "High"
                                 elif .level == "warning" then "Medium"
@@ -79,10 +78,6 @@ for i in "${!result_files[@]}"; do
                             line: (
                                 .locations[0].physicalLocation
                                     .region.startLine // 1
-                            ),
-                            code: (
-                                .locations[0].physicalLocation
-                                    .region.snippet.text // ""
                             )
                         }
                     ]
@@ -104,7 +99,6 @@ for i in "${!result_files[@]}"; do
                         [.runs[]?.results[]?]
                     elif (
                         has("title") or has("name") or
-                        has("ruleId") or has("rule_id") or
                         has("description") or has("file_path")
                     ) then [.]
                     else error("Unsupported JSON finding structure")
@@ -116,7 +110,6 @@ for i in "${!result_files[@]}"; do
                         .title // .name // .ruleId //
                         .rule_id // "Joern Finding"
                     ),
-                    rule_id: (.rule_id // .ruleId // ""),
                     severity: (
                         .severity //
                         (if .level == "error" then "High"
@@ -144,13 +137,6 @@ for i in "${!result_files[@]}"; do
                         .locations[0].physicalLocation
                             .region.startLine //
                         1
-                    ),
-                    code: (
-                        .code //
-                        .snippet //
-                        .locations[0].physicalLocation
-                            .region.snippet.text //
-                        ""
                     )
                 })
             ' "$result_file" > "$normalized"
@@ -164,12 +150,10 @@ for i in "${!result_files[@]}"; do
                     select(test("\\S")) |
                     {
                         title: .,
-                        rule_id: "",
                         severity: "Medium",
                         description: .,
                         file_path: "",
-                        line: 1,
-                        code: ""
+                        line: 1
                     }
                 ]
             ' < "$result_file" > "$normalized"
@@ -189,14 +173,15 @@ done
 # Combine all normalized result arrays.
 jq -s 'add' "$tmp_dir"/*.json > "$tmp_dir/combined.json"
 
-# Deduplicate identical rule/title/location findings.
+# Deduplicate identical rule/title/location findings, and strip fields
+# that DefectDojo's Generic Findings Import does not accept.
 jq '
     unique_by([
-        .rule_id,
         .title,
         .file_path,
         (.line | tostring)
     ])
+    | map(del(.rule_id, .code))
     | {findings: .}
 ' "$tmp_dir/combined.json" > "$OUT_FILE"
 
