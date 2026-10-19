@@ -202,7 +202,7 @@ build time.</p>
 HTMLEOF
 
 # ---- findings table -------------------------------------------------------
-tmap="$(echo "$tests_json" | jq -r '.results | map({key:(.id|tostring), value:(.test_title//"Unknown")}) | from_entries')"
+tmap="$(echo "$tests_json" | jq -r '.results | map({key:(.id|tostring), value:(if .test_title != null and .test_title != "" then .test_title elif .scan_type != null and .scan_type != "" then .scan_type else "Unknown" end)}) | from_entries')"
 
 for sev in Critical High Medium Low Info; do
     count_var="${sev,,}_count"

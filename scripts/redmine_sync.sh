@@ -210,7 +210,12 @@ jq -n \
     | ( $tr
         | map({
             key: (.id | tostring),
-            value: (.test_title // "Unknown test" | if . == "" then "Unknown test" else . end)
+            value: (
+              if .test_title != null and .test_title != "" then .test_title
+              elif .scan_type != null and .scan_type != "" then .scan_type
+              else "Unknown"
+              end
+            )
           })
         | from_entries
       ) as $tmap
@@ -310,6 +315,7 @@ subject="${marker} - ${report_total} active findings (build #${build})"
 
 existing_id=""
 existing_status_id=""
+issue_id=""
 offset=0
 rm_total=0
 
@@ -465,5 +471,85 @@ else
         jq . "$tmpdir/create-response.json" >&2 2>/dev/null ||
             cat "$tmpdir/create-response.json" >&2
         exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Attach the PDF security report to the ticket (if it exists).
+#
+# Redmine file attachment is a two-step process:
+#   a) POST /uploads.json with raw file bytes  → receive an upload token
+#   b) PUT  /issues/<id>.json with the token   → attach file to the ticket
+#
+# Failures here are non-fatal: we warn and continue so a missing PDF or
+# a Redmine upload error never breaks the sync.
+# ---------------------------------------------------------------------------
+
+# Resolve the final ticket ID (created or updated path)
+ticket_id="${existing_id:-${issue_id:-}}"
+
+PDF_FILE="${PDF_REPORT_PATH:-artifacts/report/security-report.pdf}"
+
+if [[ -z "$ticket_id" ]]; then
+    echo "WARNING: Could not determine ticket ID — skipping PDF attachment." >&2
+elif [[ ! -f "$PDF_FILE" || ! -s "$PDF_FILE" ]]; then
+    echo "No PDF report found at ${PDF_FILE} — skipping attachment."
+else
+    echo "Uploading PDF report to Redmine (${PDF_FILE})..."
+
+    # Step a: upload the raw bytes and get an upload token
+    if ! upload_code="$(
+        curl --silent --show-error \
+            --connect-timeout 15 --max-time 120 \
+            --request POST \
+            --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+            --header "Content-Type: application/octet-stream" \
+            --header "Accept: application/json" \
+            --data-binary "@${PDF_FILE}" \
+            --output "$tmpdir/upload-response.json" \
+            --write-out '%{http_code}' \
+            "${REDMINE_URL}/uploads.json"
+    )"; then
+        echo "WARNING: PDF upload request failed at transport level — skipping attachment." >&2
+    elif [[ "$upload_code" != "201" ]]; then
+        echo "WARNING: PDF upload returned HTTP ${upload_code} — skipping attachment." >&2
+        cat "$tmpdir/upload-response.json" >&2 || true
+    else
+        upload_token="$(jq -r '.upload.token // empty' "$tmpdir/upload-response.json")"
+
+        if [[ -z "$upload_token" ]]; then
+            echo "WARNING: No upload token in Redmine response — skipping attachment." >&2
+        else
+            echo "Upload token received. Attaching PDF to ticket #${ticket_id}..."
+
+            # Step b: attach the uploaded file to the ticket
+            filename="security-report-build-${BUILD_NUMBER:-unknown}.pdf"
+
+            jq -n \
+                --arg token    "$upload_token" \
+                --arg filename "$filename" \
+                '{issue: {uploads: [{token: $token, filename: $filename, content_type: "application/pdf"}]}}' \
+                > "$tmpdir/attach.json"
+
+            if ! attach_code="$(
+                curl --silent --show-error \
+                    --connect-timeout 15 --max-time 60 \
+                    --request PUT \
+                    --header "X-Redmine-API-Key: ${REDMINE_API_KEY}" \
+                    --header "Content-Type: application/json" \
+                    --header "Accept: application/json" \
+                    --data @"$tmpdir/attach.json" \
+                    --output "$tmpdir/attach-response.json" \
+                    --write-out '%{http_code}' \
+                    "${REDMINE_URL}/issues/${ticket_id}.json"
+            )"; then
+                echo "WARNING: PDF attachment request failed at transport level." >&2
+            elif [[ "$attach_code" == "200" || "$attach_code" == "204" ]]; then
+                echo "PDF report attached to Redmine ticket #${ticket_id}: ${filename}"
+            else
+                echo "WARNING: PDF attachment returned HTTP ${attach_code}." >&2
+                cat "$tmpdir/attach-response.json" >&2 || true
+            fi
+        fi
     fi
 fi
