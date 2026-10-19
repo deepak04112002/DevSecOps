@@ -862,8 +862,6 @@ pipeline {
                 }
             }
         }
-    }
-
 
         //10: a central security policy gate to your existing Jenkins pipeline. It will check findings from all scanners in DefectDojo and decide whether the build passes or fails, instead of relying only on Trivy's exit code.
 
@@ -886,6 +884,8 @@ pipeline {
                 }
             }
         }
+    }
+
 
 
 
