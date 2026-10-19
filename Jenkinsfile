@@ -301,6 +301,7 @@ pipeline {
         DEFECTDOJO_ENGAGEMENT_NAME = 'CI Pipeline'
         DEFECTDOJO_POLL_INTERVAL_SECONDS = '5'
         DEFECTDOJO_POLL_TIMEOUT_SECONDS  = '1800'
+        DEFECTDOJO_LOW_BASELINE_FILE = '/var/jenkins_home/security-baselines/defectdojo-low-findings-engagement-1.json'
 
         REDMINE_URL        = 'http://redmine:3000'
         REDMINE_PROJECT_ID = '1'
@@ -823,6 +824,30 @@ pipeline {
                 }
             }
         }
+
+
+        // a central security policy gate to your existing Jenkins pipeline. It will check findings from all scanners in DefectDojo and decide whether the build passes or fails, instead of relying only on Trivy's exit code.
+
+        // Your desired policy will be:
+        // - CRITICAL, HIGH, or MEDIUM findings: fail immediately.
+        // - Any detected secret: fail immediately.
+        // - New LOW vulnerability: pass and record it.
+        // - Previously seen LOW vulnerability found again in a later build: fail.
+        // - Scan or DefectDojo import failure: fail.
+        
+        stage('Security Policy Gate') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'defectdojo-api-token',
+                        variable: 'DEFECTDOJO_API_TOKEN'
+                    )
+                ]) {
+                    sh 'bash /opt/devsecops/scripts/defectdojo_policy_gate.sh'
+                }
+            }
+        }
+
 
         // -------------------------------------------------------------------
         // 9. Redmine Sync
