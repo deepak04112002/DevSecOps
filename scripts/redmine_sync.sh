@@ -204,6 +204,7 @@ jq -n \
     --arg build "$build" \
     --arg generated "$generated" \
     --arg engagement_url "$engagement_url" \
+    --arg defectdojo_url "$DEFECTDOJO_URL" \
     '
     ($findings[0]) as $fs
     | ($tests[0].results // []) as $tr
@@ -238,13 +239,36 @@ jq -n \
             file_path: ($f.file_path // $f.component_name // "Not specified"),
             line_number: ($f.line // "Not specified"),
             component_version: ($f.component_version // "Not specified"),
+            fixed_version: (
+              ($f.mitigation // "") |
+              if . == "" or . == null then "Not available" else . end
+            ),
+            cvss: (
+              if $f.cvssv3_score != null and $f.cvssv3_score != "" then
+                ($f.cvssv3_score | tostring)
+              elif $f.cvssv3 != null and $f.cvssv3 != "" then
+                ($f.cvssv3 | tostring)
+              elif $f.cvssv2_score != null and $f.cvssv2_score != "" then
+                ("v2:" + ($f.cvssv2_score | tostring))
+              else "Not available"
+              end
+            ),
             cwe: (if $f.cwe == null or $f.cwe == "" then "Not specified" else ($f.cwe | tostring) end),
             cves: (
               ( ($f.vulnerability_ids // [])
                 | map(if type == "object" then (.vulnerability_id // .name // .value // empty) else tostring end)
                 | map(select(length > 0)) | unique | join(", ")
               ) | if . == "" then "Not specified" else . end
-            )
+            ),
+            description: (
+              ($f.description // "") |
+              if . == "" or . == null then ""
+              else
+                ( . | split("\n") | map(select(length > 0)) | .[0:3] | join(" ") |
+                  if length > 300 then .[0:300] + "..." else . end )
+              end
+            ),
+            finding_url: ($defectdojo_url + "/finding/" + ($f.id | tostring))
           }
       ) ) as $a
     | ( $a | length ) as $total
@@ -275,9 +299,13 @@ jq -n \
                             + ( [ $a | map(select(.scanner == $s)) | sort_by(.severity) | .[]
                                   | ("  #" + (.id | tostring) + " [" + .severity + "] " + .title + "\n"
                                      + "    File/component: " + .file_path + ":" + (.line_number | tostring) + "\n"
-                                     + "    Component version: " + .component_version + "\n"
+                                     + "    Installed version: " + .component_version
+                                       + (if .fixed_version == "Not available" then "" else " → Fixed in: " + .fixed_version end) + "\n"
+                                     + "    CVSS: " + .cvss + "\n"
                                      + "    CWE: " + .cwe + "\n"
-                                     + "    CVE / vulnerability IDs: " + .cves + "\n")
+                                     + "    CVE / vulnerability IDs: " + .cves + "\n"
+                                     + (if .description == "" then "" else "    Description: " + .description + "\n" end)
+                                     + "    DefectDojo: " + .finding_url + "\n")
                                 ] | join("")
                             )
                           )

@@ -211,28 +211,44 @@ for sev in Critical High Medium Low Info; do
 
     echo "<h3>${sev} (${count_val})</h3>" >> "$html_file"
     echo '<table class="findings"><thead><tr>' >> "$html_file"
-    echo '<th>#</th><th>Title</th><th>Scanner</th><th>File / Component</th><th>Line</th><th>CWE</th><th>CVE</th><th>Description</th>' >> "$html_file"
+    echo '<th>#</th><th>Title</th><th>Scanner</th><th>File / Component</th><th>Version → Fix</th><th>CVSS</th><th>CWE</th><th>CVE</th><th>Description</th>' >> "$html_file"
     echo '</tr></thead><tbody>' >> "$html_file"
 
     echo "$all_findings" | jq -c --arg sev "$sev" '[.[] | select(.severity == $sev)] | .[]' \
     | while IFS= read -r f; do
-        fid="$(    echo "$f" | jq -r '.id')"
-        ftitle="$( echo "$f" | jq -r '.title // .name // "Finding"' | sed 's/</\&lt;/g;s/>/\&gt;/g')"
-        fpath="$(  echo "$f" | jq -r '.file_path // .component_name // ""' | sed 's/</\&lt;/g;s/>/\&gt;/g')"
-        fline="$(  echo "$f" | jq -r '.line // ""')"
-        fcwe="$(   echo "$f" | jq -r 'if .cwe == null or .cwe == "" then "" else (.cwe|tostring) end')"
-        fcves="$(  echo "$f" | jq -r '(.vulnerability_ids//[]) | map(.vulnerability_id//.name//"") | map(select(length>0)) | join(", ")')"
-        fdesc="$(  echo "$f" | jq -r '.description // ""' | head -c 300 | sed 's/</\&lt;/g;s/>/\&gt;/g;s/\n/ /g')"
-        ftest="$(  echo "$f" | jq -r '.test // ""')"
-        fscanner="$(echo "$tmap" | jq -r --arg tid "$ftest" '.[$tid] // "Unknown"')"
+        fid="$(      echo "$f" | jq -r '.id')"
+        ftitle="$(   echo "$f" | jq -r '.title // .name // "Finding"' | sed 's/</\&lt;/g;s/>/\&gt;/g')"
+        fpath="$(    echo "$f" | jq -r '.file_path // .component_name // ""' | sed 's/</\&lt;/g;s/>/\&gt;/g')"
+        fline="$(    echo "$f" | jq -r '.line // ""')"
+        fcwe="$(     echo "$f" | jq -r 'if .cwe == null or .cwe == "" then "" else (.cwe|tostring) end')"
+        fcves="$(    echo "$f" | jq -r '(.vulnerability_ids//[]) | map(.vulnerability_id//.name//"") | map(select(length>0)) | join(", ")')"
+        fdesc="$(    echo "$f" | jq -r '.description // ""' | head -c 300 | sed 's/</\&lt;/g;s/>/\&gt;/g;s/\n/ /g')"
+        ftest="$(    echo "$f" | jq -r '.test // ""')"
+        fscanner="$( echo "$tmap" | jq -r --arg tid "$ftest" '.[$tid] // "Unknown"')"
+        fver="$(     echo "$f" | jq -r '.component_version // ""')"
+        ffix="$(     echo "$f" | jq -r '.mitigation // ""' | sed 's/</\&lt;/g;s/>/\&gt;/g')"
+        fcvss="$(    echo "$f" | jq -r '
+            if .cvssv3_score != null and (.cvssv3_score|tostring) != "" then (.cvssv3_score|tostring)
+            elif .cvssv3 != null and (.cvssv3|tostring) != "" then (.cvssv3|tostring)
+            elif .cvssv2_score != null and (.cvssv2_score|tostring) != "" then ("v2:" + (.cvssv2_score|tostring))
+            else "" end')"
+
+        if [ -n "$fver" ] && [ -n "$ffix" ]; then
+            fversion_fix="${fver} → ${ffix}"
+        elif [ -n "$fver" ]; then
+            fversion_fix="$fver"
+        else
+            fversion_fix=""
+        fi
 
         cat >> "$html_file" << ROWEOF
 <tr>
   <td><a href="${DEFECTDOJO_URL}/finding/${fid}">${fid}</a></td>
   <td>${ftitle}</td>
   <td>${fscanner}</td>
-  <td>${fpath}</td>
-  <td>${fline}</td>
+  <td>${fpath}$([ -n "$fline" ] && echo ":${fline}")</td>
+  <td>${fversion_fix}</td>
+  <td>${fcvss}</td>
   <td>${fcwe}</td>
   <td>${fcves}</td>
   <td class="description">${fdesc}</td>
