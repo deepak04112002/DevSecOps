@@ -515,19 +515,16 @@ pipeline {
                     ]) {
                         sh '''
                             set -eu
-                            export IMAGE_NAME="${IMAGE_NAME}"
+                            export IMAGE_REF="${IMAGE_NAME}"
+                            export IMAGE_SRC="docker"
                             bash /opt/devsecops/scripts/trivy_image_scan.sh
                         '''
                     }
                 }
             }
-
             post {
                 always {
-                    archiveArtifacts(
-                        artifacts: 'artifacts/trivy-image/**,artifacts/sbom/**',
-                        allowEmptyArchive: true
-                    )
+                    archiveArtifacts artifacts: 'artifacts/trivy-image/**,artifacts/sbom/**', allowEmptyArchive: true
                 }
             }
         }

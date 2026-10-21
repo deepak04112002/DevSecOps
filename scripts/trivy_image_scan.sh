@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
 # scripts/trivy_image_scan.sh
 #
-# Scans a built Docker image with Trivy and generates an SBOM with syft.
-# Both artifacts are imported into DefectDojo.
+# Scans a container image with Trivy, generates an SBOM with Syft, and imports
+# the Trivy results into DefectDojo. The Security Policy Gate makes the
+# pass/fail decision, so Trivy runs with --exit-code 0.
 #
-# Environment variables:
-#   IMAGE_NAME           Required. The Docker image name:tag to scan.
-#   DEFECTDOJO_API_TOKEN Required by defectdojo_import.sh
-#   TRIVY_IMAGE_SCAN     Optional. Set to "true" to run (default: true).
+# Required environment:
+#   IMAGE_REF             Image to scan.
+#                         IMAGE_SRC=remote: digest reference (repo@sha256:...)
+#                         IMAGE_SRC=docker: local image ID (sha256:...)
+#   DEFECTDOJO_API_TOKEN  Used by defectdojo_import.sh
+#
+# Optional environment:
+#   IMAGE_SRC              remote | docker            default: remote
+#   TRIVY_IGNORE_UNFIXED   true | false               default: true
+#   TRIVY_CACHE_DIR        Trivy DB cache directory   default: .trivy-cache
+#   REPORT_DIR             default: artifacts/trivy-image
+#   SBOM_DIR               default: artifacts/sbom
+#   DEFECTDOJO_TEST_TITLE  default: Trivy Image Scan
+#   TRIVY_USERNAME / TRIVY_PASSWORD   registry credentials for private images
+#
+# Outputs:
+#   $REPORT_DIR/trivy-image-report.json
+#   $SBOM_DIR/sbom.json
 # ---------------------------------------------------------------------------
 set -Eeuo pipefail
 
-: "${IMAGE_NAME:?Set IMAGE_NAME to the image name:tag to scan}"
-: "${DEFECTDOJO_API_TOKEN:?Set DEFECTDOJO_API_TOKEN}"
-
-REPORT_DIR="artifacts/trivy-image"
-SBOM_DIR="artifacts/sbom"
-mkdir -p "$REPORT_DIR" "$SBOM_DIR"
+IMAGE_REF="${IMAGE_REF:-}"
+IMAGE_SRC="${IMAGE_SRC:-remote}"
+TRIVY_IGNORE_UNFIXED="${TRIVY_IGNORE_UNFIXED:-true}"
+TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-.trivy-cache}"
+REPORT_DIR="${REPORT_DIR:-artifacts/trivy-image}"
+SBOM_DIR="${SBOM_DIR:-artifacts/sbom}"
+DEFECTDOJO_TEST_TITLE="${DEFECTDOJO_TEST_TITLE:-Trivy Image Scan}"
+IMPORT_SCRIPT="/opt/devsecops/scripts/defectdojo_import.sh"
 
 IMAGE_REPORT="$REPORT_DIR/trivy-image-report.json"
 SBOM_FILE="$SBOM_DIR/sbom.json"
@@ -24,40 +41,77 @@ SBOM_FILE="$SBOM_DIR/sbom.json"
 log() { printf '[trivy-image] %s\n' "$*"; }
 die() { printf '[trivy-image] ERROR: %s\n' "$*" >&2; exit 1; }
 
-command -v trivy  >/dev/null 2>&1 || die "trivy is not installed."
-command -v syft   >/dev/null 2>&1 || die "syft is not installed."
-command -v jq     >/dev/null 2>&1 || die "jq is not installed."
-command -v docker >/dev/null 2>&1 || die "docker is not installed."
+# ---- Preflight -------------------------------------------------------------
+[ -n "$IMAGE_REF" ] || die "IMAGE_REF is not set."
+[ -n "${DEFECTDOJO_API_TOKEN:-}" ] || die "DEFECTDOJO_API_TOKEN is not set."
 
-# ---- 1. Scan the image with Trivy -----------------------------------------
-log "Scanning image: ${IMAGE_NAME}"
+case "$IMAGE_SRC" in
+    remote)
+        [[ "$IMAGE_REF" =~ @sha256:[a-f0-9]{64}$ ]] ||
+            die "IMAGE_SRC=remote requires a digest reference (repo@sha256:...). Got: $IMAGE_REF"
+        ;;
+    docker)
+        ;;
+    *)
+        die "IMAGE_SRC must be 'remote' or 'docker'. Got: $IMAGE_SRC"
+        ;;
+esac
 
-trivy image \
-    --exit-code 0 \
-    --format json \
-    --output "$IMAGE_REPORT" \
-    --scanners vuln,secret \
-    --ignore-unfixed \
-    "${IMAGE_NAME}"
+case "$TRIVY_IGNORE_UNFIXED" in
+    true|false) ;;
+    *) die "TRIVY_IGNORE_UNFIXED must be 'true' or 'false'." ;;
+esac
 
-log "Trivy image scan complete: $(jq '.Results | length' "$IMAGE_REPORT") result blocks."
+for tool in trivy syft jq; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed."
+done
+[ -f "$IMPORT_SCRIPT" ] || die "Import script not found: $IMPORT_SCRIPT"
 
-# ---- 2. Generate SBOM with syft -------------------------------------------
-log "Generating SBOM with syft..."
+mkdir -p "$REPORT_DIR" "$SBOM_DIR" "$TRIVY_CACHE_DIR"
+rm -f "$IMAGE_REPORT" "$SBOM_FILE"
 
-syft "${IMAGE_NAME}" \
-    --output "json=${SBOM_FILE}" \
-    --quiet
+# ---- 1. Trivy image scan ---------------------------------------------------
+trivy_args=(
+    image
+    --image-src "$IMAGE_SRC"
+    --scanners vuln,secret
+    --exit-code 0
+    --format json
+    --output "$IMAGE_REPORT"
+    --cache-dir "$TRIVY_CACHE_DIR"
+)
+if [ "$TRIVY_IGNORE_UNFIXED" = "true" ]; then
+    trivy_args+=(--ignore-unfixed)
+fi
 
-log "SBOM generated: $(jq '.artifacts | length' "$SBOM_FILE") packages."
+log "Scanning $IMAGE_REF (source: $IMAGE_SRC)..."
+trivy "${trivy_args[@]}" "$IMAGE_REF"
 
-# ---- 3. Import Trivy image scan into DefectDojo ---------------------------
-log "Importing Trivy image scan into DefectDojo..."
+jq -e 'type == "object"' "$IMAGE_REPORT" >/dev/null || die "Trivy produced invalid JSON."
 
-export DEFECTDOJO_SCAN_FILE="$IMAGE_REPORT"
-export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
-export DEFECTDOJO_TEST_TITLE="Trivy Image Scan"
+vuln_count="$(jq '[.Results[]? | .Vulnerabilities[]?] | length' "$IMAGE_REPORT")"
+secret_count="$(jq '[.Results[]? | .Secrets[]?] | length' "$IMAGE_REPORT")"
+log "Trivy complete: ${vuln_count} vulnerability finding(s), ${secret_count} secret finding(s)."
 
-bash /opt/devsecops/scripts/defectdojo_import.sh
+# ---- 2. SBOM with Syft -----------------------------------------------------
+if [ "$IMAGE_SRC" = "remote" ]; then
+    syft_source="registry:${IMAGE_REF}"
+else
+    syft_source="docker:${IMAGE_REF}"
+fi
 
-log "Done."
+log "Generating SBOM..."
+syft "$syft_source" --output "json=${SBOM_FILE}" --quiet
+
+jq -e '.artifacts | type == "array"' "$SBOM_FILE" >/dev/null || die "Syft produced invalid SBOM JSON."
+pkg_count="$(jq '.artifacts | length' "$SBOM_FILE")"
+log "SBOM complete: ${pkg_count} package(s)."
+
+# ---- 3. Import Trivy results into DefectDojo -------------------------------
+log "Importing Trivy results into DefectDojo..."
+DEFECTDOJO_SCAN_FILE="$IMAGE_REPORT" \
+DEFECTDOJO_SCAN_TYPE="Trivy Scan" \
+DEFECTDOJO_TEST_TITLE="$DEFECTDOJO_TEST_TITLE" \
+    bash "$IMPORT_SCRIPT" || die "DefectDojo import failed."
+
+log "Done. Report: ${IMAGE_REPORT}  SBOM: ${SBOM_FILE}"
