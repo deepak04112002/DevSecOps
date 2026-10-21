@@ -20,7 +20,9 @@ services:
       REDMINE_TRACKER_ID: ${REDMINE_TRACKER_ID:-1}
       REDMINE_STATUS_ID: ${REDMINE_STATUS_ID:-1}
       REDMINE_PRIORITY_ID: ${REDMINE_PRIORITY_ID:-2}
-      STAGING_BASE_URL: ${STAGING_BASE_URL:-}
+      STAGING_BASE_URL: ${STAGING_BASE_URL:-}    
+    group_add:
+      - "0"
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
