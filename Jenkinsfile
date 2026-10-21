@@ -480,8 +480,8 @@ pipeline {
                     elif [ -f pom.xml ]; then
                         mvn -B test package
                     elif [ -f package.json ]; then
-                        npm ci
-                        npm test
+                        npm ci --no-audit --no-fund --loglevel=error
+                        CI=true npm test
                     else
                         echo "No supported build file detected (Makefile / pom.xml / package.json)."
                         echo "Add the application build and test commands."
@@ -489,10 +489,14 @@ pipeline {
                     fi
 
                     # ---- Build the Docker image for downstream scanning ----
-                    # If the app repo has its own Dockerfile, use it.
-                    # Otherwise, copy the pipeline's template Dockerfile.
+                    # If the app repo has its own Dockerfile or .dockerignore, use them.
+                    # Otherwise, copy the pipeline's templates.
                     if [ ! -f Dockerfile ]; then
                         cp /opt/devsecops/infra/docker/Dockerfile.weather-app Dockerfile
+                    fi
+
+                    if [ ! -f .dockerignore ]; then
+                        cp /opt/devsecops/infra/docker/dockerignore.weather-app .dockerignore
                     fi
 
                     echo "Building Docker image: ${IMAGE_NAME}"

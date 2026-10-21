@@ -1,15 +1,16 @@
 # Dockerfile for the Weather-app React application.
-# Used by the pipeline's "Build and Unit Tests" stage to build a container
-# image that is then scanned by Trivy Image Scan and (optionally) Qualys
-# QScanner.
-#
-# This file is copied into the app repo root at build time by the pipeline.
-# If the app repo already has a Dockerfile, that takes precedence.
+# Used by the pipeline's "Build and Unit Tests" stage when the app repo has no Dockerfile.
+# Copied into the app repo root at build time by the pipeline.
 
 FROM node:20-alpine AS build
 WORKDIR /app
+
+# Copy only the dependency manifests first so this layer stays cached
+# until package.json or package-lock.json changes.
 COPY package.json package-lock.json ./
-RUN npm ci --silent
+RUN npm ci --no-audit --no-fund --loglevel=error
+
+# Source changes only invalidate from here down.
 COPY . .
 RUN npm run build
 

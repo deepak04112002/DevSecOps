@@ -24,9 +24,9 @@ SBOM_FILE="$SBOM_DIR/sbom.json"
 log() { printf '[trivy-image] %s\n' "$*"; }
 die() { printf '[trivy-image] ERROR: %s\n' "$*" >&2; exit 1; }
 
-command -v trivy >/dev/null 2>&1 || die "trivy is not installed."
-command -v syft  >/dev/null 2>&1 || die "syft is not installed."
-command -v jq    >/dev/null 2>&1 || die "jq is not installed."
+command -v trivy  >/dev/null 2>&1 || die "trivy is not installed."
+command -v syft   >/dev/null 2>&1 || die "syft is not installed."
+command -v jq     >/dev/null 2>&1 || die "jq is not installed."
 command -v docker >/dev/null 2>&1 || die "docker is not installed."
 
 # ---- 1. Scan the image with Trivy -----------------------------------------
@@ -46,8 +46,7 @@ log "Trivy image scan complete: $(jq '.Results | length' "$IMAGE_REPORT") result
 log "Generating SBOM with syft..."
 
 syft "${IMAGE_NAME}" \
-    --output json \
-    --output "$SBOM_FILE" \
+    --output "json=${SBOM_FILE}" \
     --quiet
 
 log "SBOM generated: $(jq '.artifacts | length' "$SBOM_FILE") packages."
