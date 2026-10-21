@@ -23,7 +23,7 @@ RUN apt-get update \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages --no-cache-dir weasyprint
+    && pip3 install --break-system-packages --no-cache-dir "weasyprint==70.0"
 
 # Docker CLI — for building images inside the pipeline.
 # Download the static binary directly (more reliable than the docker.io
