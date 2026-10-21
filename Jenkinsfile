@@ -268,7 +268,7 @@ pipeline {
             defaultValue: '',
             description: 'Existing Qualys report ID'
         )
-clear        booleanParam(
+        booleanParam(
             name: 'RUN_QUALYS_IMAGE',
             defaultValue: false,
             description: 'Run Qualys QScanner image vulnerability scan + SBOM (requires Qualys CS subscription)'
