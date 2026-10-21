@@ -19,12 +19,23 @@ RUN apt-get update \
        shared-mime-info \
        fonts-dejavu-core \
        unzip \
-       docker.io \
        libxml2-utils \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --break-system-packages --no-cache-dir weasyprint
+
+# Docker CLI — for building images inside the pipeline.
+# Download the static binary directly (more reliable than the docker.io
+# apt package, which may not be available on all Debian versions).
+ARG DOCKER_VERSION=27.3.1
+RUN curl -fsSL \
+    "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
+    -o /tmp/docker.tgz \
+    && tar -xzf /tmp/docker.tgz -C /tmp docker/docker \
+    && mv /tmp/docker/docker /usr/local/bin/docker \
+    && chmod +x /usr/local/bin/docker \
+    && rm -rf /tmp/docker.tgz /tmp/docker
 
 # Syft — SBOM (Software Bill of Materials) generation
 ARG SYFT_VERSION=1.26.0
