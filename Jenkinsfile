@@ -467,41 +467,24 @@ pipeline {
             }
         }
 
-        // -------------------------------------------------------------------
         // 4. Build and Unit Tests
+        //
+        // The app's own Dockerfile runs the tests in a build stage, so a
+        // failing test fails the docker build. No host-side test run.
         // -------------------------------------------------------------------
         stage('Build and Unit Tests') {
             steps {
                 sh '''
                     set -eu
 
-                    if [ -f Makefile ] && grep -qE '^[[:space:]]*test:' Makefile; then
-                        make test
-                    elif [ -f pom.xml ]; then
-                        mvn -B test package
-                    elif [ -f package.json ]; then
-                        npm ci --no-audit --no-fund --loglevel=error
-                        CI=true npm test
-                    else
-                        echo "No supported build file detected (Makefile / pom.xml / package.json)."
-                        echo "Add the application build and test commands."
-                        exit 2
-                    fi
-
-                    # ---- Build the Docker image for downstream scanning ----
-                    # If the app repo has its own Dockerfile or .dockerignore, use them.
-                    # Otherwise, copy the pipeline's templates.
                     if [ ! -f Dockerfile ]; then
-                        cp /opt/devsecops/infra/docker/Dockerfile.weather-app Dockerfile
+                        echo "ERROR: No Dockerfile found in the app repo root."
+                        exit 1
                     fi
 
-                    if [ ! -f .dockerignore ]; then
-                        cp /opt/devsecops/infra/docker/dockerignore.weather-app .dockerignore
-                    fi
-
-                    echo "Building Docker image: ${IMAGE_NAME}"
+                    echo "Building Docker image (includes unit tests): ${IMAGE_NAME}"
                     docker build -t "${IMAGE_NAME}" .
-                    echo "Image built successfully."
+                    echo "Image built and unit tests passed."
                 '''
             }
 
@@ -510,7 +493,7 @@ pipeline {
                     script {
                         notifyRedmineFailure(
                             'Build and Unit Tests',
-                            'Build or unit tests failed. Review the build-tool output, dependency installation, and test failures in the Jenkins console.'
+                            'Docker build or unit tests failed. Check the docker build output in the Jenkins console; a failing "npm test" step shows there.'
                         )
                     }
                 }
