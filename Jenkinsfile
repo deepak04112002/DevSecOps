@@ -268,6 +268,21 @@ pipeline {
             defaultValue: '',
             description: 'Existing Qualys report ID'
         )
+clear        booleanParam(
+            name: 'RUN_QUALYS_IMAGE',
+            defaultValue: false,
+            description: 'Run Qualys QScanner image vulnerability scan + SBOM (requires Qualys CS subscription)'
+        )
+        booleanParam(
+            name: 'RUN_QUALYS_WAS',
+            defaultValue: false,
+            description: 'Run Qualys WAS DAST scan against the deployed app (requires Qualys WAS subscription)'
+        )
+        string(
+            name: 'WAS_TARGET_URL',
+            defaultValue: '',
+            description: 'Target URL for Qualys WAS DAST scan (e.g. http://staging:3000). Required when RUN_QUALYS_WAS is true.'
+        )
         booleanParam(
             name: 'SYNC_REDMINE',
             defaultValue: true,
@@ -314,6 +329,9 @@ pipeline {
         REDMINE_CLOSED_STATUS_IDS  = "${params.REDMINE_CLOSED_STATUS_IDS}"
 
         PYTHONUNBUFFERED = '1'
+
+        IMAGE_NAME = "devsecops-weather-app:${env.BUILD_NUMBER ?: 'latest'}"
+        WAS_TARGET_URL = "${params.WAS_TARGET_URL}"
     }
 
     stages {
@@ -469,6 +487,17 @@ pipeline {
                         echo "Add the application build and test commands."
                         exit 2
                     fi
+
+                    # ---- Build the Docker image for downstream scanning ----
+                    # If the app repo has its own Dockerfile, use it.
+                    # Otherwise, copy the pipeline's template Dockerfile.
+                    if [ ! -f Dockerfile ]; then
+                        cp /opt/devsecops/infra/docker/Dockerfile.weather-app Dockerfile
+                    fi
+
+                    echo "Building Docker image: ${IMAGE_NAME}"
+                    docker build -t "${IMAGE_NAME}" .
+                    echo "Image built successfully."
                 '''
             }
 
@@ -485,7 +514,80 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 5. SonarQube SAST
+        // 5. Trivy Image Scan + SBOM
+        //
+        // Scans the built Docker image for vulnerabilities and secrets with
+        // Trivy, and generates an SBOM with syft. Both are imported into
+        // DefectDojo. Runs on every build (not gated).
+        // -------------------------------------------------------------------
+        stage('Trivy Image Scan + SBOM') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+                            export IMAGE_NAME="${IMAGE_NAME}"
+                            bash /opt/devsecops/scripts/trivy_image_scan.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/trivy-image/**,artifacts/sbom/**',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 6. Qualys Image Scan + SBOM (optional)
+        //
+        // Scans the built Docker image with Qualys QScanner and generates an
+        // SBOM. Gated by RUN_QUALYS_IMAGE — requires a Qualys Container
+        // Security subscription and QScanner installed in the Jenkins image.
+        // -------------------------------------------------------------------
+        stage('Qualys Image Scan + SBOM') {
+            when {
+                expression { params.RUN_QUALYS_IMAGE }
+            }
+
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                        usernamePassword(
+                            credentialsId: 'qualys-credentials',
+                            usernameVariable: 'QUALYS_USERNAME',
+                            passwordVariable: 'QUALYS_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+                            export IMAGE_NAME="${IMAGE_NAME}"
+                            bash /opt/devsecops/scripts/qualys_image_scan.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/qualys-image/**',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 7. SonarQube SAST
         //
         // Two independent catchError blocks so the two failure modes are
         // distinguished clearly:
@@ -787,9 +889,50 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 8. Qualys Export (optional) — VM scan report → DefectDojo
+        // 10. Qualys WAS DAST (optional)
+        //
+        // Runs a Qualys Web Application Scanning DAST scan against the
+        // deployed app. Gated by RUN_QUALYS_WAS — requires a Qualys WAS
+        // subscription and a running target URL.
         // -------------------------------------------------------------------
-        stage('Qualys Export') {
+        stage('Qualys WAS DAST') {
+            when {
+                expression { params.RUN_QUALYS_WAS }
+            }
+
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                        usernamePassword(
+                            credentialsId: 'qualys-credentials',
+                            usernameVariable: 'QUALYS_USERNAME',
+                            passwordVariable: 'QUALYS_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+                            export WAS_TARGET_URL="${WAS_TARGET_URL}"
+                            bash /opt/devsecops/scripts/qualys_was_dast.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/qualys-was/**',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 11. Optional Qualys VM Report Import
+        // -------------------------------------------------------------------
+        stage('Optional Qualys VM Report Import') {
             when {
                 expression { params.RUN_QUALYS }
             }

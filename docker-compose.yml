@@ -23,6 +23,7 @@ services:
       STAGING_BASE_URL: ${STAGING_BASE_URL:-}
     volumes:
       - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
       - ${APP_SOURCE_HOST_PATH:-./workspace}:/workspace/external-app:ro
       - ./artifacts:/workspace/artifacts
       - ./scripts:/opt/devsecops/scripts:ro

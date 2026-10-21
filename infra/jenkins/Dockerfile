@@ -19,10 +19,21 @@ RUN apt-get update \
        shared-mime-info \
        fonts-dejavu-core \
        unzip \
+       docker.io \
+       libxml2-utils \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --break-system-packages --no-cache-dir weasyprint
+
+# Syft — SBOM (Software Bill of Materials) generation
+ARG SYFT_VERSION=1.26.0
+RUN curl -fsSL \
+    "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+    -o /tmp/syft.tar.gz \
+    && tar -xzf /tmp/syft.tar.gz -C /usr/local/bin syft \
+    && chmod +x /usr/local/bin/syft \
+    && rm /tmp/syft.tar.gz
 
 # Trivy — SCA and filesystem vulnerability scanning
 RUN curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
@@ -44,6 +55,7 @@ RUN curl -fsSL \
        /usr/local/bin/sonar-scanner \
     && rm /tmp/sonar-scanner.zip
 
+# Joern — code property graph analysis
 RUN curl -fsSL https://github.com/joernio/joern/releases/latest/download/joern-install.sh \
     -o /tmp/joern-install.sh \
     && chmod +x /tmp/joern-install.sh \
