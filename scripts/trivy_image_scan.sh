@@ -104,18 +104,25 @@ trivy "${trivy_args[@]}" "$IMAGE_REF"
 
 jq -e 'type == "object"' "$IMAGE_REPORT" >/dev/null || die "Trivy produced invalid JSON."
 
-# ---- 1a. Normalize the artifact name --------------------------------------
-# Trivy records the image reference (including the build tag) in ArtifactName.
-# DefectDojo deduplicates on that value, so a per-build tag makes every build
-# look like a new artifact. Replace it with a stable name.
-jq --arg name "$STABLE_ARTIFACT_NAME" '.ArtifactName = $name' "$IMAGE_REPORT" \
+# ---- 1a. Normalize the artifact name and per-result targets ---------------
+# DefectDojo builds finding keys from file_path, which Trivy takes from Target.
+# For OS packages, Target is "<image>:<tag> (<os> <version>)", and the tag
+# changes every build. Replace only that image part, so "(alpine 3.21.3)" stays.
+# Language-package targets such as "usr/src/app/package-lock.json" are left alone.
+jq --arg name "$STABLE_ARTIFACT_NAME" '
+    .ArtifactName = $name
+    | if .Results then
+        .Results |= map(
+            .Target |= (
+                if type == "string"
+                then sub("^[^ ]+:[^ ]+ \\("; $name + " (")
+                else . end
+            )
+        )
+      else . end' "$IMAGE_REPORT" \
     > "$IMAGE_REPORT.tmp" && mv "$IMAGE_REPORT.tmp" "$IMAGE_REPORT" \
     || die "Could not normalize ArtifactName in Trivy report."
-log "ArtifactName normalized to: $STABLE_ARTIFACT_NAME"
-
-vuln_count="$(jq '[.Results[]? | .Vulnerabilities[]?] | length' "$IMAGE_REPORT")"
-secret_count="$(jq '[.Results[]? | .Secrets[]?] | length' "$IMAGE_REPORT")"
-log "Trivy complete: ${vuln_count} vulnerability finding(s), ${secret_count} secret finding(s)."
+log "ArtifactName and OS targets normalized to: $STABLE_ARTIFACT_NAME"
 
 # ---- 2. SBOM with Syft -----------------------------------------------------
 if [ "$IMAGE_SRC" = "remote" ]; then
