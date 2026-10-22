@@ -17,6 +17,8 @@
 #   TRIVY_CACHE_DIR             Trivy DB cache directory    default: .trivy-cache
 #   REPORT_DIR                  default: artifacts/trivy-image
 #   SBOM_DIR                    default: artifacts/sbom
+#   STABLE_ARTIFACT_NAME        ArtifactName written to the report (DefectDojo
+#                               deduplicates on it)         default: weather-app
 #   DEFECTDOJO_TEST_ID          Pin the import to this DefectDojo test ID
 #   REQUIRE_DEFECTDOJO_TEST_ID  true | false                default: false
 #                               When true, fail instead of creating a new test
@@ -35,6 +37,7 @@ TRIVY_IGNORE_UNFIXED="${TRIVY_IGNORE_UNFIXED:-true}"
 TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-.trivy-cache}"
 REPORT_DIR="${REPORT_DIR:-artifacts/trivy-image}"
 SBOM_DIR="${SBOM_DIR:-artifacts/sbom}"
+STABLE_ARTIFACT_NAME="${STABLE_ARTIFACT_NAME:-weather-app}"
 DEFECTDOJO_TEST_ID="${DEFECTDOJO_TEST_ID:-}"
 REQUIRE_DEFECTDOJO_TEST_ID="${REQUIRE_DEFECTDOJO_TEST_ID:-false}"
 DEFECTDOJO_TEST_TITLE="${DEFECTDOJO_TEST_TITLE:-Trivy Image Scan}"
@@ -100,6 +103,15 @@ log "Scanning $IMAGE_REF (source: $IMAGE_SRC)..."
 trivy "${trivy_args[@]}" "$IMAGE_REF"
 
 jq -e 'type == "object"' "$IMAGE_REPORT" >/dev/null || die "Trivy produced invalid JSON."
+
+# ---- 1a. Normalize the artifact name --------------------------------------
+# Trivy records the image reference (including the build tag) in ArtifactName.
+# DefectDojo deduplicates on that value, so a per-build tag makes every build
+# look like a new artifact. Replace it with a stable name.
+jq --arg name "$STABLE_ARTIFACT_NAME" '.ArtifactName = $name' "$IMAGE_REPORT" \
+    > "$IMAGE_REPORT.tmp" && mv "$IMAGE_REPORT.tmp" "$IMAGE_REPORT" \
+    || die "Could not normalize ArtifactName in Trivy report."
+log "ArtifactName normalized to: $STABLE_ARTIFACT_NAME"
 
 vuln_count="$(jq '[.Results[]? | .Vulnerabilities[]?] | length' "$IMAGE_REPORT")"
 secret_count="$(jq '[.Results[]? | .Secrets[]?] | length' "$IMAGE_REPORT")"
