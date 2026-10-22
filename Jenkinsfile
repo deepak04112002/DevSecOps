@@ -1019,21 +1019,20 @@ pipeline {
             }
 
             steps {
-                withCredentials([
-                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
-                    string(credentialsId: 'redmine-api-key',       variable: 'REDMINE_API_KEY')
-                ]) {
-                    sh '/opt/devsecops/scripts/redmine_sync.sh'
-                }
-            }
-
-            post {
-                failure {
-                    script {
+                script {
+                    try {
+                        withCredentials([
+                            string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                            string(credentialsId: 'redmine-api-key',       variable: 'REDMINE_API_KEY')
+                        ]) {
+                            sh '/opt/devsecops/scripts/redmine_sync.sh'
+                        }
+                    } catch (err) {
                         notifyRedmineFailure(
                             'Redmine Sync',
                             'The DefectDojo-to-Redmine sync failed. Review the Redmine API response and redmine_sync.sh console output.'
                         )
+                        throw err
                     }
                 }
             }
