@@ -467,6 +467,7 @@ pipeline {
             }
         }
 
+        // -------------------------------------------------------------------
         // 4. Build and Unit Tests
         //
         // The app's own Dockerfile runs the tests in a build stage, so a
@@ -505,7 +506,8 @@ pipeline {
         //
         // Scans the built Docker image for vulnerabilities and secrets with
         // Trivy, and generates an SBOM with syft. Both are imported into
-        // DefectDojo. Runs on every build (not gated).
+        // DefectDojo. Test ID 98 is pinned so every build reimports into the
+        // same test instead of creating a new one.
         // -------------------------------------------------------------------
         stage('Trivy Image Scan + SBOM') {
             steps {
@@ -517,6 +519,9 @@ pipeline {
                             set -eu
                             export IMAGE_REF="${IMAGE_NAME}"
                             export IMAGE_SRC="docker"
+                            export DEFECTDOJO_TEST_TITLE="Trivy Image Scan"
+                            export DEFECTDOJO_TEST_ID="98"
+                            export REQUIRE_DEFECTDOJO_TEST_ID="true"
                             bash /opt/devsecops/scripts/trivy_image_scan.sh
                         '''
                     }
@@ -587,6 +592,7 @@ pipeline {
         //     Import fail        → build FAILURE   (real infra problem;
         //                          findings didn't reach DefectDojo)
         //     Always runs even when Block A marks the stage failed.
+        //     Pinned to test ID 99.
         // -------------------------------------------------------------------
         stage('SonarQube SAST') {
             steps {
@@ -669,10 +675,11 @@ pipeline {
 
                             test -s artifacts/sonar/sonar-report.json
 
-                            # ---- Import into DefectDojo ----
+                            # ---- Import into DefectDojo (pinned to test 99) ----
                             export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
                             export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
                             export DEFECTDOJO_TEST_TITLE="SonarQube SAST"
+                            export DEFECTDOJO_TEST_ID="99"
 
                             bash /opt/devsecops/scripts/defectdojo_import.sh
                         '''
@@ -693,7 +700,10 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 6. Trivy SCA — filesystem vulnerability + secret scan → DefectDojo
+        // 8. Trivy SCA — filesystem vulnerability + secret scan → DefectDojo
+        //
+        // Uses the same scan type as the image scan, so it is pinned to its
+        // own test (100). It must never share a test ID with Trivy Image Scan.
         // -------------------------------------------------------------------
         stage('Trivy SCA') {
             steps {
@@ -717,6 +727,7 @@ pipeline {
                             export DEFECTDOJO_SCAN_FILE="artifacts/trivy/trivy-report.json"
                             export DEFECTDOJO_SCAN_TYPE="Trivy Scan"
                             export DEFECTDOJO_TEST_TITLE="Trivy SCA"
+                            export DEFECTDOJO_TEST_ID="100"
 
                             bash /opt/devsecops/scripts/defectdojo_import.sh
                         '''
@@ -736,7 +747,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 7. Joern CPG Analysis — code property graph SAST → DefectDojo
+        // 9. Joern CPG Analysis — code property graph SAST → DefectDojo
         //
         // Three steps per language:
         //   a. joern-parse  — build the CPG (.bin) from source files
@@ -873,48 +884,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 10. Qualys WAS DAST (optional)
-        //
-        // Runs a Qualys Web Application Scanning DAST scan against the
-        // deployed app. Gated by RUN_QUALYS_WAS — requires a Qualys WAS
-        // subscription and a running target URL.
-        // -------------------------------------------------------------------
-        stage('Qualys WAS DAST') {
-            when {
-                expression { params.RUN_QUALYS_WAS }
-            }
-
-            steps {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
-                    withCredentials([
-                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
-                        usernamePassword(
-                            credentialsId: 'qualys-credentials',
-                            usernameVariable: 'QUALYS_USERNAME',
-                            passwordVariable: 'QUALYS_PASSWORD'
-                        )
-                    ]) {
-                        sh '''
-                            set -eu
-                            export WAS_TARGET_URL="${WAS_TARGET_URL}"
-                            bash /opt/devsecops/scripts/qualys_was_dast.sh
-                        '''
-                    }
-                }
-            }
-
-            post {
-                always {
-                    archiveArtifacts(
-                        artifacts: 'artifacts/qualys-was/**',
-                        allowEmptyArchive: true
-                    )
-                }
-            }
-        }
-
-        // -------------------------------------------------------------------
-        // 11. Optional Qualys VM Report Import
+        // 10. Qualys VM Report Import (optional)
         // -------------------------------------------------------------------
         stage('Optional Qualys VM Report Import') {
             when {
@@ -961,7 +931,48 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 9. Security Report (PDF)
+        // 11. Qualys WAS DAST (optional)
+        //
+        // Runs a Qualys Web Application Scanning DAST scan against the
+        // deployed app. Gated by RUN_QUALYS_WAS — requires a Qualys WAS
+        // subscription and a running target URL.
+        // -------------------------------------------------------------------
+        stage('Qualys WAS DAST') {
+            when {
+                expression { params.RUN_QUALYS_WAS }
+            }
+
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                        usernamePassword(
+                            credentialsId: 'qualys-credentials',
+                            usernameVariable: 'QUALYS_USERNAME',
+                            passwordVariable: 'QUALYS_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+                            export WAS_TARGET_URL="${WAS_TARGET_URL}"
+                            bash /opt/devsecops/scripts/qualys_was_dast.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/qualys-was/**',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 12. Security Report (PDF)
         //
         // Fetches all active DefectDojo findings, builds a styled HTML report
         // grouped by severity and scanner, then converts it to PDF via
@@ -991,7 +1002,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 10. Redmine Sync
+        // 13. Redmine Sync
         //
         // Pulls every active finding from DefectDojo (all scanners combined),
         // builds a consolidated report grouped by scanner and severity, then
@@ -1029,7 +1040,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 11. Security Policy Gate
+        // 14. Security Policy Gate
         //
         // Checks findings from all scanners in DefectDojo and decides whether
         // the build passes or fails, instead of relying only on Trivy's exit
@@ -1065,7 +1076,7 @@ pipeline {
         }
 
         unstable {
-            echo "Pipeline completed UNSTABLE (SonarQube quality gate). Build: #${env.BUILD_NUMBER}"
+            echo "Pipeline completed UNSTABLE (code-quality or non-blocking stage). Build: #${env.BUILD_NUMBER}"
         }
 
         failure {

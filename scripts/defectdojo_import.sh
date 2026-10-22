@@ -1,328 +1,268 @@
-
 #!/usr/bin/env bash
 # scripts/defectdojo_import.sh
+#
+# Imports one scan into DefectDojo. Works for the first run (creates a test)
+# and for later runs (reimports into the same test).
+#
+# Choosing the target test:
+#   DEFECTDOJO_TEST_ID is set   -> use that test. It must exist and have the
+#                                  requested scan type, or the script fails.
+#   otherwise                   -> use the oldest test in the engagement with
+#                                  the same title and scan type.
+#   no test found               -> create one with import-scan.
+#
+# When a test is known, the scan goes to reimport-scan with test=<id>, so the
+# existing test is updated and no new test is created. Set
+# REQUIRE_DEFECTDOJO_TEST_ID=true to fail instead of creating a test.
+#
+# Required environment:
+#   DEFECTDOJO_URL, DEFECTDOJO_API_TOKEN, DEFECTDOJO_ENGAGEMENT_ID,
+#   DEFECTDOJO_SCAN_TYPE, DEFECTDOJO_SCAN_FILE, DEFECTDOJO_TEST_TITLE
+#
+# Optional environment:
+#   DEFECTDOJO_TEST_ID              pin the stage to one test
+#   REQUIRE_DEFECTDOJO_TEST_ID      true | false              default: false
+#   DEFECTDOJO_POLL_INTERVAL_SECONDS                          default: 5
+#   DEFECTDOJO_POLL_TIMEOUT_SECONDS                           default: 1800
+# ---------------------------------------------------------------------------
 set -Eeuo pipefail
 umask 077
 
 : "${DEFECTDOJO_URL:?Set DEFECTDOJO_URL}"
 : "${DEFECTDOJO_API_TOKEN:?Set DEFECTDOJO_API_TOKEN}"
-: "${DEFECTDOJO_PRODUCT_NAME:?Set DEFECTDOJO_PRODUCT_NAME}"
-: "${DEFECTDOJO_ENGAGEMENT_NAME:?Set DEFECTDOJO_ENGAGEMENT_NAME}"
 : "${DEFECTDOJO_ENGAGEMENT_ID:?Set DEFECTDOJO_ENGAGEMENT_ID}"
 : "${DEFECTDOJO_SCAN_TYPE:?Set DEFECTDOJO_SCAN_TYPE}"
 : "${DEFECTDOJO_SCAN_FILE:?Set DEFECTDOJO_SCAN_FILE}"
-
-POLL_INTERVAL_SECONDS="${DEFECTDOJO_POLL_INTERVAL_SECONDS:-5}"
-POLL_TIMEOUT_SECONDS="${DEFECTDOJO_POLL_TIMEOUT_SECONDS:-1800}"
-TITLE="${DEFECTDOJO_TEST_TITLE:-CI security scan}"
-
-command -v curl >/dev/null 2>&1 || {
-    echo "ERROR: curl is required." >&2
-    exit 1
-}
-
-command -v jq >/dev/null 2>&1 || {
-    echo "ERROR: jq is required." >&2
-    exit 1
-}
-
-for name in POLL_INTERVAL_SECONDS POLL_TIMEOUT_SECONDS; do
-    value="${!name}"
-    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: $name must be a positive integer." >&2
-        exit 1
-    fi
-done
-
-[[ "$DEFECTDOJO_ENGAGEMENT_ID" =~ ^[1-9][0-9]*$ ]] || {
-    echo "ERROR: DEFECTDOJO_ENGAGEMENT_ID must be a positive integer." >&2
-    exit 1
-}
-
-[[ -n "$DEFECTDOJO_PRODUCT_NAME" && -n "$DEFECTDOJO_ENGAGEMENT_NAME" ]] || {
-    echo "ERROR: Product and engagement names must not be empty." >&2
-    exit 1
-}
-
-[[ -n "$TITLE" && -n "$DEFECTDOJO_SCAN_TYPE" ]] || {
-    echo "ERROR: Test title and scan type must not be empty." >&2
-    exit 1
-}
-
-[[ -f "$DEFECTDOJO_SCAN_FILE" && -s "$DEFECTDOJO_SCAN_FILE" ]] || {
-    echo "ERROR: Scan file is missing, not a regular file, or empty." >&2
-    exit 1
-}
+: "${DEFECTDOJO_TEST_TITLE:?Set DEFECTDOJO_TEST_TITLE}"
 
 DEFECTDOJO_URL="${DEFECTDOJO_URL%/}"
+POLL_INTERVAL_SECONDS="${DEFECTDOJO_POLL_INTERVAL_SECONDS:-5}"
+POLL_TIMEOUT_SECONDS="${DEFECTDOJO_POLL_TIMEOUT_SECONDS:-1800}"
+REQUIRE_TEST_ID="${REQUIRE_DEFECTDOJO_TEST_ID:-false}"
+PINNED_TEST_ID="${DEFECTDOJO_TEST_ID:-}"
+TITLE="$DEFECTDOJO_TEST_TITLE"
+
+TEST_ID=""          # test to reimport into; empty means create one
+RESULT_TEST_ID=""   # test that DefectDojo reports it imported into
+
+log() { printf '[defectdojo] %s\n' "$*"; }
+die() { printf '[defectdojo] ERROR: %s\n' "$*" >&2; exit 1; }
+is_pos_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+
+command -v curl >/dev/null 2>&1 || die "curl is required."
+command -v jq   >/dev/null 2>&1 || die "jq is required."
+
+is_pos_int "$DEFECTDOJO_ENGAGEMENT_ID" || die "DEFECTDOJO_ENGAGEMENT_ID must be a positive integer."
+is_pos_int "$POLL_INTERVAL_SECONDS"    || die "DEFECTDOJO_POLL_INTERVAL_SECONDS must be a positive integer."
+is_pos_int "$POLL_TIMEOUT_SECONDS"     || die "DEFECTDOJO_POLL_TIMEOUT_SECONDS must be a positive integer."
+
+case "$REQUIRE_TEST_ID" in
+    true|false) ;;
+    *) die "REQUIRE_DEFECTDOJO_TEST_ID must be 'true' or 'false'." ;;
+esac
+
+if [[ -n "$PINNED_TEST_ID" ]]; then
+    is_pos_int "$PINNED_TEST_ID" || die "DEFECTDOJO_TEST_ID must be a positive integer."
+fi
+
+if [[ "$REQUIRE_TEST_ID" == "true" && -z "$PINNED_TEST_ID" ]]; then
+    die "REQUIRE_DEFECTDOJO_TEST_ID=true requires DEFECTDOJO_TEST_ID."
+fi
+
+[[ -s "$DEFECTDOJO_SCAN_FILE" ]] || die "Scan file is missing or empty: $DEFECTDOJO_SCAN_FILE"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-response_file="$tmpdir/response.json"
-tests_file="$tmpdir/tests.json"
-test_file="$tmpdir/test.json"
-
-echo "Checking existing DefectDojo tests..."
-echo "Product: $DEFECTDOJO_PRODUCT_NAME"
-echo "Engagement: $DEFECTDOJO_ENGAGEMENT_NAME (ID $DEFECTDOJO_ENGAGEMENT_ID)"
-echo "Requested title: $TITLE"
-echo "Scan type: $DEFECTDOJO_SCAN_TYPE"
-
-# Fetch tests belonging to this engagement.
-if ! http_code="$(
+# api_get <path> <output-file> [extra curl args]
+# Prints the HTTP status code.
+api_get() {
+    local path="$1" out="$2"
+    shift 2
     curl --silent --show-error \
-        --connect-timeout 15 \
-        --max-time 60 \
+        --connect-timeout 15 --max-time 60 \
         --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
         --header "Accept: application/json" \
+        --output "$out" \
+        --write-out '%{http_code}' \
+        "$@" \
+        "${DEFECTDOJO_URL}${path}"
+}
+
+# ---- 1. Choose the target test ---------------------------------------------
+resolve_test() {
+    local code
+
+    if [[ -n "$PINNED_TEST_ID" ]]; then
+        code="$(api_get "/api/v2/tests/${PINNED_TEST_ID}/" "$tmpdir/pinned.json")" \
+            || die "Could not reach DefectDojo."
+
+        case "$code" in
+            200) ;;
+            404) die "DEFECTDOJO_TEST_ID=${PINNED_TEST_ID} does not exist. Fix the pin; not creating a new test." ;;
+            *)   die "Reading test ${PINNED_TEST_ID} returned HTTP ${code}." ;;
+        esac
+
+        local actual_type actual_title
+        actual_type="$(jq -r '.scan_type // empty' "$tmpdir/pinned.json")"
+        actual_title="$(jq -r '.title // .test_title // "untitled"' "$tmpdir/pinned.json")"
+
+        [[ "$actual_type" == "$DEFECTDOJO_SCAN_TYPE" ]] ||
+            die "Test ${PINNED_TEST_ID} has scan type '${actual_type}', expected '${DEFECTDOJO_SCAN_TYPE}'."
+
+        log "Pinned test ${PINNED_TEST_ID} ('${actual_title}', ${actual_type})."
+        TEST_ID="$PINNED_TEST_ID"
+        return
+    fi
+
+    code="$(api_get "/api/v2/tests/" "$tmpdir/tests.json" \
         --get \
         --data-urlencode "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
-        --data-urlencode "limit=200" \
-        --output "$tests_file" \
-        --write-out '%{http_code}' \
-        "${DEFECTDOJO_URL}/api/v2/tests/"
-)"; then
-    echo "ERROR: Could not retrieve DefectDojo tests." >&2
-    exit 1
-fi
+        --data-urlencode "limit=500")" || die "Could not list DefectDojo tests."
 
-if [[ "$http_code" != "200" ]]; then
-    echo "ERROR: Listing DefectDojo tests returned HTTP $http_code." >&2
-    cat "$tests_file" >&2
-    exit 1
-fi
+    [[ "$code" == "200" ]] || die "Listing tests returned HTTP ${code}."
+    jq -e '.results | type == "array"' "$tmpdir/tests.json" >/dev/null ||
+        die "Unexpected response while listing tests."
 
-jq -e '.results | type == "array"' "$tests_file" >/dev/null 2>&1 || {
-    echo "ERROR: Unexpected response while listing DefectDojo tests." >&2
-    cat "$tests_file" >&2
-    exit 1
-}
-
-# Prefer an exact title and scan-type match.
-test_id="$(
-    jq -r \
-        --arg title "$TITLE" \
-        --arg scan_type "$DEFECTDOJO_SCAN_TYPE" \
-        '[
-            .results[]
-            | select(
-                .test_title == $title
-                and .scan_type == $scan_type
-            )
-        ]
-        | sort_by(.id)
-        | last
-        | .id // empty' "$tests_file"
-)"
-
-if [[ "$test_id" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Found an existing matching test: ID $test_id."
-    endpoint="reimport-scan"
-else
-    # Legacy tests may have a different title, such as "CI security scan".
-    # Reuse the newest test of the same scan type rather than creating
-    # another test unnecessarily. If the legacy test cannot be safely
-    # reused (missing/invalid id or empty title), fall back to a fresh
-    # import-scan with the requested title instead of aborting -- a
-    # duplicate test is preferable to losing the findings and skipping
-    # the rest of the pipeline (SonarQube import, Redmine sync).
-    existing_test="$(
-        jq -c \
-            --arg scan_type "$DEFECTDOJO_SCAN_TYPE" \
-            '[
-                .results[]
-                | select(.scan_type == $scan_type)
-            ]
+    # Oldest test with the same title and scan type. The v2 API returns
+    # "title"; accept "test_title" as well.
+    TEST_ID="$(
+        jq -r --arg title "$TITLE" --arg scan_type "$DEFECTDOJO_SCAN_TYPE" '
+            [ .results[]
+              | select(((.title // .test_title) == $title) and (.scan_type == $scan_type)) ]
             | sort_by(.id)
-            | last // empty' "$tests_file"
+            | first
+            | .id // empty
+        ' "$tmpdir/tests.json"
     )"
 
-    if [[ -n "$existing_test" ]]; then
-        test_id="$(jq -r '.id // empty' <<< "$existing_test")"
-        existing_title="$(jq -r '.test_title // empty' <<< "$existing_test")"
-
-        if [[ "$test_id" =~ ^[1-9][0-9]*$ && -n "$existing_title" ]]; then
-            echo "No exact title match; reusing existing test ID $test_id."
-            echo "Using existing title: $existing_title"
-            TITLE="$existing_title"
-            endpoint="reimport-scan"
-        else
-            echo "WARNING: Existing test for scan type '$DEFECTDOJO_SCAN_TYPE'" >&2
-            echo "WARNING: has an invalid id ('$test_id') or empty title and" >&2
-            echo "WARNING: cannot be safely reused. Falling back to a fresh" >&2
-            echo "WARNING: import-scan with title '$TITLE'." >&2
-            endpoint="import-scan"
-        fi
+    if [[ -n "$TEST_ID" ]]; then
+        log "Found existing test '${TITLE}' (ID ${TEST_ID})."
     else
-        echo "No existing test for this scan type was found."
-        echo "Creating the first test in engagement $DEFECTDOJO_ENGAGEMENT_ID."
-        endpoint="import-scan"
+        log "No test titled '${TITLE}' with scan type '${DEFECTDOJO_SCAN_TYPE}' in this engagement."
     fi
-fi
-
-echo "Import endpoint: $endpoint"
-echo "Test title: $TITLE"
-
-# Submit the scan. import-scan creates a test; reimport-scan updates one.
-if [[ "$endpoint" == "reimport-scan" ]]; then
-    request_url="${DEFECTDOJO_URL}/api/v2/reimport-scan/"
-else
-    request_url="${DEFECTDOJO_URL}/api/v2/import-scan/"
-fi
-
-if ! http_code="$(
-    if [[ "$endpoint" == "reimport-scan" ]]; then
-        curl --silent --show-error \
-            --connect-timeout 15 \
-            --max-time 300 \
-            --request POST \
-            --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
-            --header "Accept: application/json" \
-            --form-string "scan_type=${DEFECTDOJO_SCAN_TYPE}" \
-            --form-string "product_name=${DEFECTDOJO_PRODUCT_NAME}" \
-            --form-string "engagement_name=${DEFECTDOJO_ENGAGEMENT_NAME}" \
-            --form-string "close_old_findings=true" \
-            --form-string "minimum_severity=Info" \
-            --form-string "deduplication_execution_mode=async_wait" \
-            --form-string "test_title=${TITLE}" \
-            --form "file=@${DEFECTDOJO_SCAN_FILE}" \
-            --output "$response_file" \
-            --write-out '%{http_code}' \
-            "$request_url"
-    else
-        curl --silent --show-error \
-            --connect-timeout 15 \
-            --max-time 300 \
-            --request POST \
-            --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
-            --header "Accept: application/json" \
-            --form-string "scan_type=${DEFECTDOJO_SCAN_TYPE}" \
-            --form-string "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
-            --form-string "close_old_findings=true" \
-            --form-string "minimum_severity=Info" \
-            --form-string "deduplication_execution_mode=async_wait" \
-            --form-string "test_title=${TITLE}" \
-            --form "file=@${DEFECTDOJO_SCAN_FILE}" \
-            --output "$response_file" \
-            --write-out '%{http_code}' \
-            "$request_url"
-    fi
-)"; then
-    echo "ERROR: DefectDojo API request failed at the transport level." >&2
-    [[ ! -s "$response_file" ]] || cat "$response_file" >&2
-    exit 1
-fi
-
-case "$http_code" in
-    200|201|202)
-        ;;
-    *)
-        echo "ERROR: DefectDojo import failed (HTTP $http_code)." >&2
-        cat "$response_file" >&2
-        exit 1
-        ;;
-esac
-
-jq -e 'type == "object"' "$response_file" >/dev/null 2>&1 || {
-    echo "ERROR: DefectDojo returned a non-JSON or unexpected response." >&2
-    cat "$response_file" >&2
-    exit 1
 }
 
-background_import="$(jq -r '.background_import // false' "$response_file")"
+# ---- 2. Submit the scan -----------------------------------------------------
+submit_scan() {
+    local endpoint code
+    local -a common target
 
-if [[ "$background_import" == "true" ]]; then
-    test_id="$(jq -r '.test_id // empty' "$response_file")"
+    common=(
+        --form-string "scan_type=${DEFECTDOJO_SCAN_TYPE}"
+        --form-string "close_old_findings=true"
+        --form-string "minimum_severity=Info"
+        --form-string "deduplication_execution_mode=async_wait"
+        --form "file=@${DEFECTDOJO_SCAN_FILE}"
+    )
 
-    if [[ ! "$test_id" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: Background import response has no valid test_id." >&2
-        jq . "$response_file" >&2
-        exit 1
+    if [[ -n "$TEST_ID" ]]; then
+        endpoint="reimport-scan"
+        target=(--form-string "test=${TEST_ID}")
+        log "Endpoint: reimport-scan (test ${TEST_ID})"
+    else
+        endpoint="import-scan"
+        target=(
+            --form-string "engagement=${DEFECTDOJO_ENGAGEMENT_ID}"
+            --form-string "test_title=${TITLE}"
+        )
+        log "Endpoint: import-scan (new test '${TITLE}')"
     fi
 
-    echo "Background import accepted for test $test_id; waiting..."
+    code="$(
+        curl --silent --show-error \
+            --connect-timeout 15 --max-time 300 \
+            --request POST \
+            --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
+            --header "Accept: application/json" \
+            "${common[@]}" \
+            "${target[@]}" \
+            --output "$tmpdir/response.json" \
+            --write-out '%{http_code}' \
+            "${DEFECTDOJO_URL}/api/v2/${endpoint}/"
+    )" || {
+        [[ ! -s "$tmpdir/response.json" ]] || cat "$tmpdir/response.json" >&2
+        die "DefectDojo request failed at the transport level."
+    }
+
+    case "$code" in
+        200|201|202) ;;
+        *)
+            cat "$tmpdir/response.json" >&2
+            die "DefectDojo ${endpoint} failed (HTTP ${code})."
+            ;;
+    esac
+
+    jq -e 'type == "object"' "$tmpdir/response.json" >/dev/null ||
+        die "DefectDojo returned a non-JSON response."
+
+    RESULT_TEST_ID="$(jq -r '.test_id // empty' "$tmpdir/response.json")"
+    [[ "$RESULT_TEST_ID" =~ ^[1-9][0-9]*$ ]] ||
+        die "DefectDojo response has no valid test_id."
+
+    if [[ -n "$TEST_ID" && "$RESULT_TEST_ID" != "$TEST_ID" ]]; then
+        die "Import went to test ${RESULT_TEST_ID}, expected ${TEST_ID}. Stopping."
+    fi
+}
+
+# ---- 3. Wait for processing ---------------------------------------------------
+wait_for_import() {
+    local deadline status processing code
     deadline=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
 
     while :; do
-        if ! poll_code="$(
-            curl --silent --show-error \
-                --connect-timeout 15 \
-                --max-time 60 \
-                --header "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
-                --header "Accept: application/json" \
-                --output "$test_file" \
-                --write-out '%{http_code}' \
-                "${DEFECTDOJO_URL}/api/v2/tests/${test_id}/"
-        )"; then
-            echo "ERROR: Failed to poll DefectDojo test $test_id." >&2
-            exit 1
-        fi
+        code="$(api_get "/api/v2/tests/${RESULT_TEST_ID}/" "$tmpdir/status.json")" \
+            || die "Could not poll test ${RESULT_TEST_ID}."
 
-        if [[ "$poll_code" != "200" ]]; then
-            echo "ERROR: Test status request returned HTTP $poll_code." >&2
-            [[ ! -s "$test_file" ]] || cat "$test_file" >&2
-            exit 1
-        fi
-
-        jq -e 'type == "object"' "$test_file" >/dev/null 2>&1 || {
-            echo "ERROR: Invalid DefectDojo test-status response." >&2
-            cat "$test_file" >&2
-            exit 1
+        [[ "$code" == "200" ]] || {
+            cat "$tmpdir/status.json" >&2
+            die "Test status request returned HTTP ${code}."
         }
 
-        status="$(jq -r '.status // empty' "$test_file")"
-        processing="$(jq -r '.processing // false' "$test_file")"
+        status="$(jq -r '.status // empty' "$tmpdir/status.json")"
+        processing="$(jq -r '.processing // false' "$tmpdir/status.json")"
 
         case "$status" in
             Processed)
-                if [[ "$processing" == "true" ]]; then
-                    echo "Import is still processing; waiting..."
-                else
-                    echo "DefectDojo background import completed."
-                    break
+                if [[ "$processing" != "true" ]]; then
+                    log "Background import completed."
+                    return
                 fi
+                log "Still processing; waiting..."
                 ;;
             Failed)
-                echo "ERROR: DefectDojo reports that test $test_id failed." >&2
-                jq . "$test_file" >&2
-                exit 1
+                jq . "$tmpdir/status.json" >&2
+                die "DefectDojo reports that test ${RESULT_TEST_ID} failed."
                 ;;
             *)
-                echo "DefectDojo test status: ${status:-unknown}; waiting..."
+                log "Status: ${status:-unknown}; waiting..."
                 ;;
         esac
 
-        if (( $(date +%s) >= deadline )); then
-            echo "ERROR: Timed out waiting for test $test_id." >&2
-            jq . "$test_file" >&2
-            exit 1
-        fi
-
+        (( $(date +%s) < deadline )) || die "Timed out waiting for test ${RESULT_TEST_ID}."
         sleep "$POLL_INTERVAL_SECONDS"
     done
+}
 
-    echo "DefectDojo response summary:"
-    jq '{test_id, status, processing}' "$test_file"
+# ---- Run ----------------------------------------------------------------------
+echo "Scan type:  ${DEFECTDOJO_SCAN_TYPE}"
+echo "Test title: ${TITLE}"
+
+resolve_test
+submit_scan
+
+if [[ "$(jq -r '.background_import // false' "$tmpdir/response.json")" == "true" ]]; then
+    wait_for_import
 else
-    if ! jq -e '.deduplication_complete == true' \
-        "$response_file" >/dev/null 2>&1; then
-        echo "ERROR: Import returned, but deduplication completion was not confirmed." >&2
-        jq . "$response_file" >&2
-        exit 1
-    fi
-
-    echo "DefectDojo import and deduplication completed."
-    jq '{
-        test,
-        test_id,
-        scan_date,
-        findings,
-        statistics,
-        deduplication_complete,
-        message,
-        detail
-    }' "$response_file"
+    jq -e '.deduplication_complete == true' "$tmpdir/response.json" >/dev/null ||
+        die "Import returned, but deduplication was not confirmed."
+    log "Import and deduplication completed."
 fi
 
-echo "DefectDojo import stage completed successfully."
+jq '{test, test_id, statistics}' "$tmpdir/response.json"
+log "Test ID used: ${RESULT_TEST_ID}"
+
+if [[ -z "$PINNED_TEST_ID" ]]; then
+    log "To lock this stage to the same test, set DEFECTDOJO_TEST_ID=${RESULT_TEST_ID}."
+fi
+log "Done."

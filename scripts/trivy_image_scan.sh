@@ -8,16 +8,19 @@
 # Required environment:
 #   IMAGE_REF             Image to scan.
 #                         IMAGE_SRC=remote: digest reference (repo@sha256:...)
-#                         IMAGE_SRC=docker: local image ID (sha256:...)
+#                         IMAGE_SRC=docker: local image ID or name:tag
 #   DEFECTDOJO_API_TOKEN  Used by defectdojo_import.sh
 #
 # Optional environment:
-#   IMAGE_SRC              remote | docker            default: remote
-#   TRIVY_IGNORE_UNFIXED   true | false               default: true
-#   TRIVY_CACHE_DIR        Trivy DB cache directory   default: .trivy-cache
-#   REPORT_DIR             default: artifacts/trivy-image
-#   SBOM_DIR               default: artifacts/sbom
-#   DEFECTDOJO_TEST_TITLE  default: Trivy Image Scan
+#   IMAGE_SRC                   remote | docker             default: remote
+#   TRIVY_IGNORE_UNFIXED        true | false                default: true
+#   TRIVY_CACHE_DIR             Trivy DB cache directory    default: .trivy-cache
+#   REPORT_DIR                  default: artifacts/trivy-image
+#   SBOM_DIR                    default: artifacts/sbom
+#   DEFECTDOJO_TEST_ID          Pin the import to this DefectDojo test ID
+#   REQUIRE_DEFECTDOJO_TEST_ID  true | false                default: false
+#                               When true, fail instead of creating a new test
+#   DEFECTDOJO_TEST_TITLE       default: Trivy Image Scan
 #   TRIVY_USERNAME / TRIVY_PASSWORD   registry credentials for private images
 #
 # Outputs:
@@ -32,6 +35,8 @@ TRIVY_IGNORE_UNFIXED="${TRIVY_IGNORE_UNFIXED:-true}"
 TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-.trivy-cache}"
 REPORT_DIR="${REPORT_DIR:-artifacts/trivy-image}"
 SBOM_DIR="${SBOM_DIR:-artifacts/sbom}"
+DEFECTDOJO_TEST_ID="${DEFECTDOJO_TEST_ID:-}"
+REQUIRE_DEFECTDOJO_TEST_ID="${REQUIRE_DEFECTDOJO_TEST_ID:-false}"
 DEFECTDOJO_TEST_TITLE="${DEFECTDOJO_TEST_TITLE:-Trivy Image Scan}"
 IMPORT_SCRIPT="/opt/devsecops/scripts/defectdojo_import.sh"
 
@@ -50,17 +55,24 @@ case "$IMAGE_SRC" in
         [[ "$IMAGE_REF" =~ @sha256:[a-f0-9]{64}$ ]] ||
             die "IMAGE_SRC=remote requires a digest reference (repo@sha256:...). Got: $IMAGE_REF"
         ;;
-    docker)
-        ;;
-    *)
-        die "IMAGE_SRC must be 'remote' or 'docker'. Got: $IMAGE_SRC"
-        ;;
+    docker) ;;
+    *) die "IMAGE_SRC must be 'remote' or 'docker'. Got: $IMAGE_SRC" ;;
 esac
 
 case "$TRIVY_IGNORE_UNFIXED" in
     true|false) ;;
     *) die "TRIVY_IGNORE_UNFIXED must be 'true' or 'false'." ;;
 esac
+
+case "$REQUIRE_DEFECTDOJO_TEST_ID" in
+    true|false) ;;
+    *) die "REQUIRE_DEFECTDOJO_TEST_ID must be 'true' or 'false'." ;;
+esac
+
+if [ "$REQUIRE_DEFECTDOJO_TEST_ID" = "true" ]; then
+    [[ "$DEFECTDOJO_TEST_ID" =~ ^[1-9][0-9]*$ ]] ||
+        die "DEFECTDOJO_TEST_ID must be a positive integer when REQUIRE_DEFECTDOJO_TEST_ID=true."
+fi
 
 for tool in trivy syft jq; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed."
@@ -108,10 +120,11 @@ pkg_count="$(jq '.artifacts | length' "$SBOM_FILE")"
 log "SBOM complete: ${pkg_count} package(s)."
 
 # ---- 3. Import Trivy results into DefectDojo -------------------------------
-log "Importing Trivy results into DefectDojo..."
+log "Importing Trivy results into DefectDojo (test ID: ${DEFECTDOJO_TEST_ID:-not pinned})..."
 DEFECTDOJO_SCAN_FILE="$IMAGE_REPORT" \
 DEFECTDOJO_SCAN_TYPE="Trivy Scan" \
 DEFECTDOJO_TEST_TITLE="$DEFECTDOJO_TEST_TITLE" \
+DEFECTDOJO_TEST_ID="$DEFECTDOJO_TEST_ID" \
     bash "$IMPORT_SCRIPT" || die "DefectDojo import failed."
 
 log "Done. Report: ${IMAGE_REPORT}  SBOM: ${SBOM_FILE}"
