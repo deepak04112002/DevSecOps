@@ -1,9 +1,8 @@
 // ---------------------------------------------------------------------------
-// notifyRedmineFailure — creates or updates a single Redmine ticket per
-// failing stage/job. Used only for non-scanner stages (Validate Config,
-// Checkout, Build, Redmine Sync) where the consolidated findings ticket
-// won't exist. Scanner stage failures are captured in the consolidated
-// DefectDojo → Redmine findings ticket produced by Redmine Sync.
+// notifyRedmineFailure: creates or updates a single Redmine ticket per
+// failing stage/job. Used for non-scanner stages only. Scanner and gate
+// failures are captured in the consolidated DefectDojo → Redmine ticket
+// produced by Redmine Sync.
 // ---------------------------------------------------------------------------
 def notifyRedmineFailure(String stageName, String details = '') {
     withCredentials([
@@ -53,9 +52,8 @@ def notifyRedmineFailure(String stageName, String details = '') {
                     commit="${REDMINE_FAILURE_COMMIT:-Unknown}"
                     url="${BUILD_URL:-Unavailable}"
 
-                    # Stable marker (no build number) — lets us find and
-                    # update the existing ticket instead of creating a new one
-                    # on every failed build.
+                    # Stable marker (no build number) so the existing ticket is
+                    # updated instead of a new one being created on every failure.
                     marker="[PIPELINE FAILURE] ${stage} - ${job}"
                     subject="${marker} #${build}"
 
@@ -239,99 +237,89 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
-        timeout(time: 90, unit: 'MINUTES')
+        timeout(time: 150, unit: 'MINUTES')
     }
 
     parameters {
-        string(
-            name: 'GIT_REPOSITORY',
-            defaultValue: 'https://github.com/deepak04112002/Weather-app',
-            description: 'Git repository URL (leave empty to use SCM checkout)'
-        )
-        string(
-            name: 'GIT_BRANCH',
-            defaultValue: 'main',
-            description: 'Git branch'
-        )
-        string(
-            name: 'SONAR_PROJECT_KEY',
-            defaultValue: 'external-app',
-            description: 'SonarQube project key'
-        )
-        booleanParam(
-            name: 'RUN_QUALYS',
-            defaultValue: false,
-            description: 'Export an existing Qualys VM report'
-        )
-        string(
-            name: 'QUALYS_REPORT_ID',
-            defaultValue: '',
-            description: 'Existing Qualys report ID'
-        )
-        booleanParam(
-            name: 'RUN_QUALYS_IMAGE',
-            defaultValue: false,
-            description: 'Run Qualys QScanner image vulnerability scan + SBOM (requires Qualys CS subscription)'
-        )
-        booleanParam(
-            name: 'RUN_QUALYS_WAS',
-            defaultValue: false,
-            description: 'Run Qualys WAS DAST scan against the deployed app (requires Qualys WAS subscription)'
-        )
-        string(
-            name: 'WAS_TARGET_URL',
-            defaultValue: '',
-            description: 'Target URL for Qualys WAS DAST scan (e.g. http://staging:3000). Required when RUN_QUALYS_WAS is true.'
-        )
-        booleanParam(
-            name: 'SYNC_REDMINE',
-            defaultValue: true,
-            description: 'Sync active findings to Redmine'
-        )
-        booleanParam(
-            name: 'REOPEN_CLOSED_REDMINE_TICKETS',
-            defaultValue: false,
-            description: 'Reopen the consolidated Redmine ticket if it was closed and findings are active again'
-        )
-        string(
-            name: 'REDMINE_REOPEN_STATUS_ID',
-            defaultValue: '',
-            description: 'Redmine status ID to use when reopening; required if reopening is enabled'
-        )
-        string(
-            name: 'REDMINE_CLOSED_STATUS_IDS',
-            defaultValue: '',
-            description: 'Comma-separated Redmine closed status IDs; required if reopening is enabled'
-        )
+        string(name: 'GIT_REPOSITORY', defaultValue: 'https://github.com/deepak04112002/Weather-app',
+               description: 'Git repository URL (leave empty to use SCM checkout)')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Git branch')
+        string(name: 'SONAR_PROJECT_KEY', defaultValue: 'external-app', description: 'SonarQube project key')
+
+        booleanParam(name: 'RUN_DEPLOY', defaultValue: false,
+                     description: 'Push to ECR, deploy to staging and production, run ZAP and Gate 2 (requires AWS)')
+
+        booleanParam(name: 'RUN_QUALYS', defaultValue: false,
+                     description: 'Export an existing Qualys VM report')
+        string(name: 'QUALYS_REPORT_ID', defaultValue: '', description: 'Existing Qualys report ID')
+        booleanParam(name: 'RUN_QUALYS_IMAGE', defaultValue: false,
+                     description: 'Run Qualys QScanner image scan + SBOM (requires Qualys CS subscription)')
+        booleanParam(name: 'RUN_QUALYS_WAS', defaultValue: false,
+                     description: 'Run Qualys WAS DAST against staging (requires RUN_DEPLOY and Qualys WAS subscription)')
+
+        string(name: 'AWS_ACCOUNT_ID', defaultValue: '', description: 'AWS account ID (12 digits); needed when RUN_DEPLOY is true')
+        string(name: 'AWS_REGION', defaultValue: 'ap-south-1', description: 'AWS region for ECR and ECS')
+        string(name: 'ECR_REPOSITORY', defaultValue: 'devsecops-weather-app', description: 'ECR repository name')
+
+        string(name: 'STAGING_URL', defaultValue: 'http://staging:3000',
+               description: 'Staging URL for OWASP ZAP and Qualys WAS')
+        string(name: 'ZAP_SCAN_MINUTES', defaultValue: '30', description: 'Maximum ZAP full scan duration in minutes')
+
+        string(name: 'ECS_CLUSTER_STAGING', defaultValue: '', description: 'ECS cluster for staging')
+        string(name: 'ECS_SERVICE_STAGING', defaultValue: '', description: 'ECS service for staging')
+        string(name: 'ECS_CLUSTER_PRODUCTION', defaultValue: '', description: 'ECS cluster for production')
+        string(name: 'ECS_SERVICE_PRODUCTION', defaultValue: '', description: 'ECS service for production')
+        string(name: 'CONTAINER_NAME', defaultValue: '', description: 'Container name inside the ECS task definition')
+
+        booleanParam(name: 'SYNC_REDMINE', defaultValue: true, description: 'Sync active findings to Redmine')
+        booleanParam(name: 'REOPEN_CLOSED_REDMINE_TICKETS', defaultValue: false,
+                     description: 'Reopen the consolidated Redmine ticket if it was closed and findings are active again')
+        string(name: 'REDMINE_REOPEN_STATUS_ID', defaultValue: '',
+               description: 'Redmine status ID to use when reopening; required if reopening is enabled')
+        string(name: 'REDMINE_CLOSED_STATUS_IDS', defaultValue: '',
+               description: 'Comma-separated Redmine closed status IDs; required if reopening is enabled')
     }
 
     environment {
-        SONAR_HOST_URL        = 'http://sonarqube:9000'
-        SONAR_PROJECT_KEY     = "${params.SONAR_PROJECT_KEY}"
+        SONAR_HOST_URL    = 'http://sonarqube:9000'
+        SONAR_PROJECT_KEY = "${params.SONAR_PROJECT_KEY}"
 
-        DEFECTDOJO_URL            = 'http://defectdojo-nginx:8080'
-        DEFECTDOJO_PRODUCT_ID     = '1'
-        DEFECTDOJO_ENGAGEMENT_ID  = '1'
-        DEFECTDOJO_PRODUCT_NAME   = 'DevSecOps Pipeline'
-        DEFECTDOJO_ENGAGEMENT_NAME = 'CI Pipeline'
+        DEFECTDOJO_URL                   = 'http://defectdojo-nginx:8080'
+        DEFECTDOJO_PRODUCT_ID            = '1'
+        DEFECTDOJO_ENGAGEMENT_ID         = '1'
+        DEFECTDOJO_PRODUCT_NAME          = 'DevSecOps Pipeline'
+        DEFECTDOJO_ENGAGEMENT_NAME       = 'CI Pipeline'
         DEFECTDOJO_POLL_INTERVAL_SECONDS = '5'
         DEFECTDOJO_POLL_TIMEOUT_SECONDS  = '1800'
-        DEFECTDOJO_LOW_BASELINE_FILE = '/var/jenkins_home/security-baselines/defectdojo-low-findings-engagement-1.json'
+        DEFECTDOJO_LOW_BASELINE_FILE     = '/var/jenkins_home/security-baselines/defectdojo-low-findings-engagement-1.json'
 
-        REDMINE_URL        = 'http://redmine:3000'
-        REDMINE_PROJECT_ID = '1'
-        REDMINE_TRACKER_ID = '1'
-        REDMINE_STATUS_ID  = '1'
+        REDMINE_URL         = 'http://redmine:3000'
+        REDMINE_PROJECT_ID  = '1'
+        REDMINE_TRACKER_ID  = '1'
+        REDMINE_STATUS_ID   = '1'
         REDMINE_PRIORITY_ID = '2'
 
-        REDMINE_REOPEN_CLOSED      = "${params.REOPEN_CLOSED_REDMINE_TICKETS}"
-        REDMINE_REOPEN_STATUS_ID   = "${params.REDMINE_REOPEN_STATUS_ID}"
-        REDMINE_CLOSED_STATUS_IDS  = "${params.REDMINE_CLOSED_STATUS_IDS}"
+        REDMINE_REOPEN_CLOSED     = "${params.REOPEN_CLOSED_REDMINE_TICKETS}"
+        REDMINE_REOPEN_STATUS_ID  = "${params.REDMINE_REOPEN_STATUS_ID}"
+        REDMINE_CLOSED_STATUS_IDS = "${params.REDMINE_CLOSED_STATUS_IDS}"
 
         PYTHONUNBUFFERED = '1'
 
         IMAGE_NAME = "devsecops-weather-app:${env.BUILD_NUMBER ?: 'latest'}"
-        WAS_TARGET_URL = "${params.WAS_TARGET_URL}"
+
+        RUN_DEPLOY     = "${params.RUN_DEPLOY}"
+        AWS_REGION     = "${params.AWS_REGION}"
+        ECR_REPOSITORY = "${params.ECR_REPOSITORY}"
+        ECR_REGISTRY   = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.AWS_REGION}.amazonaws.com"
+
+        STAGING_URL      = "${params.STAGING_URL}"
+        ZAP_SCAN_MINUTES = "${params.ZAP_SCAN_MINUTES}"
+
+        ECS_CLUSTER_STAGING    = "${params.ECS_CLUSTER_STAGING}"
+        ECS_SERVICE_STAGING    = "${params.ECS_SERVICE_STAGING}"
+        ECS_CLUSTER_PRODUCTION = "${params.ECS_CLUSTER_PRODUCTION}"
+        ECS_SERVICE_PRODUCTION = "${params.ECS_SERVICE_PRODUCTION}"
+        CONTAINER_NAME         = "${params.CONTAINER_NAME}"
     }
 
     stages {
@@ -348,6 +336,27 @@ pipeline {
                     : "${DEFECTDOJO_PRODUCT_NAME:?Set DEFECTDOJO_PRODUCT_NAME}"
                     : "${DEFECTDOJO_ENGAGEMENT_NAME:?Set DEFECTDOJO_ENGAGEMENT_NAME}"
                     : "${REDMINE_URL:?Set REDMINE_URL}"
+
+                    if [ "$RUN_DEPLOY" = "true" ]; then
+                        : "${AWS_ACCOUNT_ID:?Set AWS_ACCOUNT_ID}"
+                        : "${AWS_REGION:?Set AWS_REGION}"
+                        : "${ECR_REPOSITORY:?Set ECR_REPOSITORY}"
+                        : "${STAGING_URL:?Set STAGING_URL}"
+                        : "${ECS_CLUSTER_STAGING:?Set ECS_CLUSTER_STAGING}"
+                        : "${ECS_SERVICE_STAGING:?Set ECS_SERVICE_STAGING}"
+                        : "${CONTAINER_NAME:?Set CONTAINER_NAME}"
+
+                        printf '%s' "$AWS_ACCOUNT_ID" | grep -Eq '^[0-9]{12}$' || {
+                            echo "ERROR: AWS_ACCOUNT_ID must be 12 digits." >&2; exit 1; }
+
+                        if [ "$GIT_BRANCH" = "main" ]; then
+                            : "${ECS_CLUSTER_PRODUCTION:?Set ECS_CLUSTER_PRODUCTION}"
+                            : "${ECS_SERVICE_PRODUCTION:?Set ECS_SERVICE_PRODUCTION}"
+                        fi
+                    fi
+
+                    printf '%s' "$ZAP_SCAN_MINUTES" | grep -Eq '^[1-9][0-9]*$' || {
+                        echo "ERROR: ZAP_SCAN_MINUTES must be a positive integer." >&2; exit 1; }
 
                     for name in REDMINE_PROJECT_ID REDMINE_TRACKER_ID \
                                 REDMINE_STATUS_ID REDMINE_PRIORITY_ID; do
@@ -381,7 +390,7 @@ pipeline {
                         IFS="$old_ifs"
                     fi
 
-                    echo "Configuration validation passed."
+                    echo "Configuration validation passed. Deploy stages enabled: ${RUN_DEPLOY}"
                 '''
             }
 
@@ -430,12 +439,7 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 3. Gitleaks Secret Scan — runs before any build or external scanner
-        //
-        // Scans the checked-out repository (full git history by default) for
-        // committed secrets. The wrapper script produces the JSON report,
-        // imports it into DefectDojo, and the Security Policy Gate fails the
-        // build on any detected secret.
+        // 3. Gitleaks Secret Scan
         // -------------------------------------------------------------------
         stage('Gitleaks Secret Scan') {
             steps {
@@ -448,6 +452,7 @@ pipeline {
 
                             export GITLEAKS_SOURCE="."
                             export GITLEAKS_REPORT_DIR="artifacts/gitleaks"
+                            export DEFECTDOJO_TEST_TITLE="Gitleaks Secret Scan"
 
                             bash /opt/devsecops/scripts/gitleaks_scan.sh
                         '''
@@ -462,16 +467,14 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-                // No notifyRedmineFailure — findings are captured in the
-                // consolidated Redmine Sync ticket.
             }
         }
 
         // -------------------------------------------------------------------
         // 4. Build and Unit Tests
         //
-        // The app's own Dockerfile runs the tests in a build stage, so a
-        // failing test fails the docker build. No host-side test run.
+        // The app's Dockerfile runs the tests in a build stage, so a failing
+        // test fails the docker build.
         // -------------------------------------------------------------------
         stage('Build and Unit Tests') {
             steps {
@@ -503,11 +506,6 @@ pipeline {
 
         // -------------------------------------------------------------------
         // 5. Trivy Image Scan + SBOM
-        //
-        // Scans the built Docker image for vulnerabilities and secrets with
-        // Trivy, and generates an SBOM with syft. Both are imported into
-        // DefectDojo. Test ID 98 is pinned so every build reimports into the
-        // same test instead of creating a new one.
         // -------------------------------------------------------------------
         stage('Trivy Image Scan + SBOM') {
             steps {
@@ -527,19 +525,19 @@ pipeline {
                     }
                 }
             }
+
             post {
                 always {
-                    archiveArtifacts artifacts: 'artifacts/trivy-image/**,artifacts/sbom/**', allowEmptyArchive: true
+                    archiveArtifacts(
+                        artifacts: 'artifacts/trivy-image/**,artifacts/sbom/**',
+                        allowEmptyArchive: true
+                    )
                 }
             }
         }
 
         // -------------------------------------------------------------------
         // 6. Qualys Image Scan + SBOM (optional)
-        //
-        // Scans the built Docker image with Qualys QScanner and generates an
-        // SBOM. Gated by RUN_QUALYS_IMAGE — requires a Qualys Container
-        // Security subscription and QScanner installed in the Jenkins image.
         // -------------------------------------------------------------------
         stage('Qualys Image Scan + SBOM') {
             when {
@@ -559,6 +557,7 @@ pipeline {
                         sh '''
                             set -eu
                             export IMAGE_NAME="${IMAGE_NAME}"
+                            export DEFECTDOJO_TEST_TITLE="Qualys Image Scan"
                             bash /opt/devsecops/scripts/qualys_image_scan.sh
                         '''
                     }
@@ -578,25 +577,14 @@ pipeline {
         // -------------------------------------------------------------------
         // 7. SonarQube SAST
         //
-        // Two independent catchError blocks so the two failure modes are
-        // distinguished clearly:
-        //
-        //   Block A – sonar-scanner / quality gate
-        //     Quality gate fail  → build UNSTABLE  (code-quality warning,
-        //                          does NOT block downstream stages)
-        //     Scanner crash      → build UNSTABLE  (same treatment; the
-        //                          DefectDojo import may still succeed with
-        //                          whatever issues were already uploaded)
-        //
-        //   Block B – SonarQube API export + DefectDojo import
-        //     Import fail        → build FAILURE   (real infra problem;
-        //                          findings didn't reach DefectDojo)
-        //     Always runs even when Block A marks the stage failed.
-        //     Pinned to test ID 99.
+        // Block A: sonar-scanner and the quality gate.
+        // Block B: export issues from the SonarQube API and import them into
+        //          DefectDojo (test 99). Runs even if Block A failed.
+        // Both blocks mark the stage FAILURE on error, so Security Gate 1
+        // is the final decision point.
         // -------------------------------------------------------------------
         stage('SonarQube SAST') {
             steps {
-                // Block A: run the scanner; quality-gate failure → UNSTABLE
                 catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     withCredentials([
                         string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
@@ -615,11 +603,9 @@ pipeline {
                     }
                 }
 
-                // Block B: export issues from SonarQube API and import to
-                // DefectDojo. Runs regardless of Block A outcome.
                 catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     withCredentials([
-                        string(credentialsId: 'sonarqube-token',    variable: 'SONAR_TOKEN'),
+                        string(credentialsId: 'sonarqube-token',     variable: 'SONAR_TOKEN'),
                         string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
                     ]) {
                         sh '''
@@ -627,7 +613,6 @@ pipeline {
 
                             mkdir -p artifacts/sonar
 
-                            # ---- Paginate the SonarQube issues API ----
                             page=1
                             total_pages=1
                             all_issues="[]"
@@ -675,7 +660,6 @@ pipeline {
 
                             test -s artifacts/sonar/sonar-report.json
 
-                            # ---- Import into DefectDojo (pinned to test 99) ----
                             export DEFECTDOJO_SCAN_FILE="artifacts/sonar/sonar-report.json"
                             export DEFECTDOJO_SCAN_TYPE="SonarQube Scan"
                             export DEFECTDOJO_TEST_TITLE="SonarQube SAST"
@@ -694,16 +678,11 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-                // No notifyRedmineFailure — scanner findings are
-                // captured in the consolidated Redmine Sync ticket.
             }
         }
 
         // -------------------------------------------------------------------
-        // 8. Trivy SCA — filesystem vulnerability + secret scan → DefectDojo
-        //
-        // Uses the same scan type as the image scan, so it is pinned to its
-        // own test (100). It must never share a test ID with Trivy Image Scan.
+        // 8. Trivy SCA: filesystem vulnerability and secret scan
         // -------------------------------------------------------------------
         stage('Trivy SCA') {
             steps {
@@ -742,19 +721,11 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-                // No notifyRedmineFailure — captured in consolidated ticket.
             }
         }
 
         // -------------------------------------------------------------------
-        // 9. Joern CPG Analysis — code property graph SAST → DefectDojo
-        //
-        // Three steps per language:
-        //   a. joern-parse  — build the CPG (.bin) from source files
-        //   b. joern --script query.sc  — run security queries against the
-        //      CPG and write *-results.json into artifacts/joern/
-        //   c. joern_import.sh  — convert result files to Generic Findings
-        //      Import format and push to DefectDojo
+        // 9. Joern CPG Analysis
         // -------------------------------------------------------------------
         stage('Joern CPG Analysis') {
             steps {
@@ -779,9 +750,6 @@ pipeline {
                             \\) -prune -o -type f -print \
                                 > artifacts/joern/source-files.txt
 
-                            # -------------------------------------------------
-                            # run_parser: build CPG then run security queries
-                            # -------------------------------------------------
                             run_parser() {
                                 language="$1"
                                 pattern="$2"
@@ -812,7 +780,6 @@ pipeline {
                                     return 0
                                 fi
 
-                                # Step a: build CPG
                                 echo "Building CPG for $language..."
                                 joern-parse \
                                     --language "$language" \
@@ -823,14 +790,10 @@ pipeline {
                                     return 0
                                 }
 
-                                # Step b: pick language-specific script, fall back to generic
                                 query_dir="/opt/devsecops/infra/security/joern"
-                                # rubysrc language uses the ruby script
                                 script_lang="$language"
                                 [ "$script_lang" = "rubysrc" ] && script_lang="ruby"
-                                # newc (C++) reuses the c script
                                 [ "$script_lang" = "newc"    ] && script_lang="c"
-                                # kotlin reuses the java CPG model but has its own script
                                 query_script="${query_dir}/query_${script_lang}.sc"
                                 if [ ! -f "$query_script" ]; then
                                     echo "No specific query script for $language — using generic."
@@ -864,7 +827,6 @@ pipeline {
                             run_parser swift       '\\.swift$'
                             run_parser abap        '\\.abap$'
 
-                            # Step c: import all result files into DefectDojo
                             export DEFECTDOJO_TEST_TITLE="Joern CPG Analysis"
                             bash /opt/devsecops/scripts/joern_import.sh
                         '''
@@ -879,7 +841,6 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-                // No notifyRedmineFailure — captured in consolidated ticket.
             }
         }
 
@@ -926,20 +887,210 @@ pipeline {
                         allowEmptyArchive: true
                     )
                 }
-                // No notifyRedmineFailure — captured in consolidated ticket.
             }
         }
 
         // -------------------------------------------------------------------
-        // 11. Qualys WAS DAST (optional)
+        // 11. Security Gate 1: SAST / SCA / Image / Secrets
         //
-        // Runs a Qualys Web Application Scanning DAST scan against the
-        // deployed app. Gated by RUN_QUALYS_WAS — requires a Qualys WAS
-        // subscription and a running target URL.
+        // Always runs. Fails the pipeline on any blocking finding.
+        // -------------------------------------------------------------------
+        stage('Security Gate 1 - SAST/SCA/Image/Secrets') {
+            steps {
+                script {
+                    def titles = [
+                        'Gitleaks Secret Scan',
+                        'Trivy Image Scan',
+                        'Trivy SCA',
+                        'SonarQube SAST',
+                        'Joern CPG Analysis'
+                    ]
+                    if (params.RUN_QUALYS)       { titles << 'Qualys Vulnerability Scan' }
+                    if (params.RUN_QUALYS_IMAGE) { titles << 'Qualys Image Scan' }
+
+                    env.GATE_TEST_TITLES       = titles.join(',')
+                    env.GATE_BUILD_START_EPOCH = "${(currentBuild.startTimeInMillis / 1000) as long}"
+                }
+
+                withCredentials([
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                ]) {
+                    sh '''
+                        set -eu
+                        export GATE_NAME="gate-1"
+                        bash /opt/devsecops/scripts/defectdojo_policy_gate.sh
+                    '''
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 12. Push to ECR (requires RUN_DEPLOY)
+        //
+        // Runs only after Gate 1. The digest is saved so staging and
+        // production deploy the exact image that was scanned.
+        // -------------------------------------------------------------------
+        stage('Push to ECR') {
+            when {
+                expression { params.RUN_DEPLOY }
+            }
+
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-ecr-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        set -eu
+                        mkdir -p artifacts/ecr
+
+                        sha="$(git rev-parse --short HEAD)"
+                        ECR_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}-${sha}"
+
+                        aws ecr get-login-password --region "$AWS_REGION" \
+                            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+                        docker tag "$IMAGE_NAME" "$ECR_IMAGE"
+                        docker push "$ECR_IMAGE"
+
+                        digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_IMAGE")"
+                        printf '%s\n' "$digest" > artifacts/ecr/image-ref.txt
+                        echo "Pushed: $digest"
+
+                        docker logout "$ECR_REGISTRY" || true
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/ecr/**',
+                        allowEmptyArchive: true
+                    )
+                }
+                failure {
+                    script {
+                        notifyRedmineFailure(
+                            'Push to ECR',
+                            'Pushing the image to ECR failed. Check AWS credentials, the ECR repository name, and Docker login output.'
+                        )
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 13. Deploy to Staging (requires RUN_DEPLOY)
+        // -------------------------------------------------------------------
+        stage('Deploy to Staging') {
+            when {
+                expression { params.RUN_DEPLOY }
+            }
+
+            steps {
+                script {
+                    env.ECR_IMAGE = readFile('artifacts/ecr/image-ref.txt').trim()
+                }
+
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-ecr-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh 'bash /opt/devsecops/scripts/deploy.sh staging "$ECR_IMAGE"'
+                }
+
+                // Wait until staging responds before the DAST/PT stages start.
+                sh '''
+                    set -eu
+                    curl --fail --silent --show-error \
+                        --retry 30 --retry-delay 5 --retry-connrefused \
+                        "$STAGING_URL" >/dev/null
+                '''
+            }
+
+            post {
+                failure {
+                    script {
+                        notifyRedmineFailure(
+                            'Deploy to Staging',
+                            'Deploying to staging failed or staging did not respond. Check the ECS service events and the deploy.sh output.'
+                        )
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 14. OWASP ZAP Penetration Test (requires RUN_DEPLOY)
+        //
+        // Catches scanner errors and fails the stage. Missing findings then
+        // make Gate 2 fail, which is the fail-closed behavior we want.
+        // -------------------------------------------------------------------
+        stage('OWASP ZAP Penetration Test') {
+            when {
+                expression { params.RUN_DEPLOY }
+            }
+
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    withCredentials([
+                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+                            mkdir -p artifacts/zap
+                            chmod 777 artifacts/zap   # the ZAP container writes as a non-root user
+
+                            # ZAP exit codes: 0 = pass, 1 = warnings, 2 = failures found.
+                            # Anything higher is a scanner error.
+                            rc=0
+                            docker run --rm --network host \
+                                -v "$(pwd)/artifacts/zap:/zap/wrk:rw" \
+                                ghcr.io/zaproxy/zaproxy:stable \
+                                zap-full-scan.py \
+                                    -t "$STAGING_URL" \
+                                    -m "$ZAP_SCAN_MINUTES" \
+                                    -x zap-report.xml \
+                                    -r zap-report.html \
+                                    -I || rc=$?
+
+                            if [ "$rc" -gt 2 ]; then
+                                echo "ERROR: ZAP scanner failed (exit ${rc})." >&2
+                                exit 1
+                            fi
+
+                            test -s artifacts/zap/zap-report.xml
+
+                            export DEFECTDOJO_SCAN_FILE="artifacts/zap/zap-report.xml"
+                            export DEFECTDOJO_SCAN_TYPE="ZAP Scan"
+                            export DEFECTDOJO_TEST_TITLE="OWASP ZAP PT"
+                            bash /opt/devsecops/scripts/defectdojo_import.sh
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'artifacts/zap/**',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 15. Qualys WAS DAST (requires RUN_DEPLOY and RUN_QUALYS_WAS)
         // -------------------------------------------------------------------
         stage('Qualys WAS DAST') {
             when {
-                expression { params.RUN_QUALYS_WAS }
+                expression { params.RUN_DEPLOY && params.RUN_QUALYS_WAS }
             }
 
             steps {
@@ -954,7 +1105,8 @@ pipeline {
                     ]) {
                         sh '''
                             set -eu
-                            export WAS_TARGET_URL="${WAS_TARGET_URL}"
+                            export WAS_TARGET_URL="$STAGING_URL"
+                            export DEFECTDOJO_TEST_TITLE="Qualys WAS DAST"
                             bash /opt/devsecops/scripts/qualys_was_dast.sh
                         '''
                     }
@@ -972,121 +1124,117 @@ pipeline {
         }
 
         // -------------------------------------------------------------------
-        // 12. Security Report (PDF)
-        //
-        // Fetches all active DefectDojo findings, builds a styled HTML report
-        // grouped by severity and scanner, then converts it to PDF via
-        // weasyprint. The PDF is archived as a Jenkins artifact.
-        // Stage failure is non-blocking (catchError UNSTABLE) so a missing
-        // weasyprint or rendering issue never breaks the pipeline.
+        // 16. Security Gate 2: DAST / PT (requires RUN_DEPLOY)
         // -------------------------------------------------------------------
-        stage('Security Report (PDF)') {
-            steps {
-                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                    withCredentials([
-                        string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
-                    ]) {
-                        sh 'bash /opt/devsecops/scripts/generate_report.sh'
-                    }
-                }
-            }
-
-            post {
-                always {
-                    archiveArtifacts(
-                        artifacts: 'artifacts/report/**',
-                        allowEmptyArchive: true
-                    )
-                }
-            }
-        }
-
-        // -------------------------------------------------------------------
-        // 13. Redmine Sync
-        //
-        // Pulls every active finding from DefectDojo (all scanners combined),
-        // builds a consolidated report grouped by scanner and severity, then
-        // creates or updates a single Redmine ticket for this job.
-        //
-        // First run  → ticket created.
-        // Later runs → same ticket updated: description replaced with the
-        //              latest full report; a short per-build summary appended
-        //              as a note (running history).
-        // -------------------------------------------------------------------
-        stage('Redmine Sync') {
+        stage('Security Gate 2 - DAST/PT') {
             when {
-                expression { params.SYNC_REDMINE }
+                expression { params.RUN_DEPLOY }
             }
 
             steps {
                 script {
-                    try {
-                        withCredentials([
-                            string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
-                            string(credentialsId: 'redmine-api-key',       variable: 'REDMINE_API_KEY')
-                        ]) {
-                            sh '/opt/devsecops/scripts/redmine_sync.sh'
-                        }
-                    } catch (err) {
-                        notifyRedmineFailure(
-                            'Redmine Sync',
-                            'The DefectDojo-to-Redmine sync failed. Review the Redmine API response and redmine_sync.sh console output.'
-                        )
-                        throw err
-                    }
+                    def titles = ['OWASP ZAP PT']
+                    if (params.RUN_QUALYS_WAS) { titles << 'Qualys WAS DAST' }
+
+                    env.GATE_TEST_TITLES       = titles.join(',')
+                    env.GATE_BUILD_START_EPOCH = "${(currentBuild.startTimeInMillis / 1000) as long}"
+                }
+
+                withCredentials([
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                ]) {
+                    sh '''
+                        set -eu
+                        export GATE_NAME="gate-2"
+                        bash /opt/devsecops/scripts/defectdojo_policy_gate.sh
+                    '''
                 }
             }
         }
 
         // -------------------------------------------------------------------
-        // 14. Security Policy Gate
-        //
-        // Checks findings from all scanners in DefectDojo and decides whether
-        // the build passes or fails, instead of relying only on Trivy's exit
-        // code.
-        //
-        // Policy:
-        // - CRITICAL, HIGH, or MEDIUM findings: fail immediately.
-        // - Any detected secret (Gitleaks or Trivy): fail immediately.
-        // - New LOW vulnerability: pass and record it.
-        // - Previously seen LOW vulnerability found again in a later build: fail.
-        // - Scan or DefectDojo import failure: fail.
+        // 17. Deploy to Production (requires RUN_DEPLOY, manual approval)
         // -------------------------------------------------------------------
-        stage('Security Policy Gate') {
+        stage('Deploy to Production') {
+            when {
+                expression { params.RUN_DEPLOY && params.GIT_BRANCH == 'main' }
+            }
+
             steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'defectdojo-api-token',
-                        variable: 'DEFECTDOJO_API_TOKEN'
-                    )
-                ]) {
-                    sh 'bash /opt/devsecops/scripts/defectdojo_policy_gate.sh'
+                timeout(time: 60, unit: 'MINUTES') {
+                    input message: 'Security Gates 1 and 2 passed. Deploy this image to production?',
+                          ok: 'Deploy'
+                }
+
+                script {
+                    env.ECR_IMAGE = readFile('artifacts/ecr/image-ref.txt').trim()
+                }
+
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-ecr-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh 'bash /opt/devsecops/scripts/deploy.sh production "$ECR_IMAGE"'
+                }
+            }
+
+            post {
+                failure {
+                    script {
+                        notifyRedmineFailure(
+                            'Deploy to Production',
+                            'Production deploy failed. Check the ECS service events and the deploy.sh output.'
+                        )
+                    }
                 }
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Global post actions
+    // Post actions. Report and Redmine sync run even when a gate fails.
     // -----------------------------------------------------------------------
     post {
+        always {
+            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                withCredentials([
+                    string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN')
+                ]) {
+                    sh 'bash /opt/devsecops/scripts/generate_report.sh'
+                }
+            }
+
+            script {
+                if (params.SYNC_REDMINE) {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                        withCredentials([
+                            string(credentialsId: 'defectdojo-api-token', variable: 'DEFECTDOJO_API_TOKEN'),
+                            string(credentialsId: 'redmine-api-key',      variable: 'REDMINE_API_KEY')
+                        ]) {
+                            sh '/opt/devsecops/scripts/redmine_sync.sh'
+                        }
+                    }
+                }
+            }
+
+            archiveArtifacts(
+                artifacts: 'artifacts/**',
+                allowEmptyArchive: true
+            )
+        }
+
         success {
             echo "Pipeline completed successfully. Build: #${env.BUILD_NUMBER}"
         }
 
         unstable {
-            echo "Pipeline completed UNSTABLE (code-quality or non-blocking stage). Build: #${env.BUILD_NUMBER}"
+            echo "Pipeline completed UNSTABLE. Build: #${env.BUILD_NUMBER}"
         }
 
         failure {
             echo "Pipeline FAILED. Build: #${env.BUILD_NUMBER}"
-        }
-
-        always {
-            archiveArtifacts(
-                artifacts: 'artifacts/**',
-                allowEmptyArchive: true
-            )
         }
     }
 }
