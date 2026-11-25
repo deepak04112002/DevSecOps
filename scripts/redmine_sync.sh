@@ -332,8 +332,8 @@ jq -n \
     ' > "$report_file"
 
 report_total="$(jq -r '.total' "$report_file")"
-report="$(jq -r '.report' "$report_file")"
-note="$(jq -r '.note' "$report_file")"
+jq -r '.report' "$report_file" > "$tmpdir/report.txt"
+jq -r '.note'   "$report_file" > "$tmpdir/note.txt"
 
 # ---------------------------------------------------------------------------
 # 4. Find the existing consolidated ticket for this job (stable marker).
@@ -418,16 +418,16 @@ if [[ -n "$existing_id" ]]; then
         echo "Ticket #${existing_id} was closed; reopening and updating."
         jq -n \
             --argjson status_id "$REDMINE_REOPEN_STATUS_ID" \
-            --arg subject "$subject" \
-            --arg description "$report" \
-            --arg notes "$note" \
+            --arg     subject   "$subject" \
+            --rawfile description "$tmpdir/report.txt" \
+            --rawfile notes       "$tmpdir/note.txt" \
             '{issue: {status_id: $status_id, subject: $subject, description: $description, notes: $notes}}' \
             > "$tmpdir/update.json"
     else
         jq -n \
-            --arg subject "$subject" \
-            --arg description "$report" \
-            --arg notes "$note" \
+            --arg     subject     "$subject" \
+            --rawfile description "$tmpdir/report.txt" \
+            --rawfile notes       "$tmpdir/note.txt" \
             '{issue: {subject: $subject, description: $description, notes: $notes}}' \
             > "$tmpdir/update.json"
     fi
@@ -459,12 +459,12 @@ else
     echo "No existing consolidated ticket for: ${job}; creating one."
 
     jq -n \
-        --argjson project_id "$REDMINE_PROJECT_ID" \
-        --argjson tracker_id "$REDMINE_TRACKER_ID" \
-        --argjson status_id "$REDMINE_STATUS_ID" \
+        --argjson project_id  "$REDMINE_PROJECT_ID" \
+        --argjson tracker_id  "$REDMINE_TRACKER_ID" \
+        --argjson status_id   "$REDMINE_STATUS_ID" \
         --argjson priority_id "$REDMINE_PRIORITY_ID" \
-        --arg subject "$subject" \
-        --arg description "$report" \
+        --arg     subject     "$subject" \
+        --rawfile description "$tmpdir/report.txt" \
         '{issue: {
             project_id: $project_id,
             tracker_id: $tracker_id,
